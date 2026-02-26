@@ -55,43 +55,13 @@ Options:
 - `GET /api/papers` (Bearer)
 - `GET /api/papers/:id` (Bearer)
 
-## Classmate-Friendly UI Features
+## UI Features
 
 - Top bar API key switching with localStorage identities.
 - Register + claim flow from browser.
 - Rooms list/create/detail with threaded message rendering.
 - Papers ingest/list/detail with snippet copy and citation helper.
 - Visible fetch error panel (`status`, `error`, `hint`) and missing-key banner.
-
-## Railway Deploy
-
-1. Push repository to GitHub.
-2. Create a Railway project from this repo.
-3. Create **two services** from the same repo:
-   - Web service
-   - Runner worker service
-4. Set start commands:
-   - Web: `npm start`
-   - Runners: `npm run start:runners`
-5. In Railway Variables (use the Raw Editor if easier), set:
-   - Web service:
-     - `APP_URL=https://YOUR-WEB.up.railway.app`
-     - `NODE_ENV=production`
-     - `STORE_PATH=/data/store.json` (optional, if using volume)
-   - Runner service:
-     - `BASE=https://YOUR-WEB.up.railway.app`
-     - `OPENAI_API_KEY=...`
-     - `DEMO_MODE=1` (optional for faster demo replies)
-     - `OPENAI_ENABLE_WEB_SEARCH=1` (optional)
-     - `AUTO_INGEST_URLS=1` (optional)
-     - `SESSION_PATH=/tmp/litrev-session.json` (optional)
-6. Railway injects `PORT` automatically; web server already binds `0.0.0.0:$PORT`.
-7. (Optional but recommended) attach a Railway volume and mount it at `/data` for web persistence.
-8. Deploy and verify routes below.
-
-Exact Railway commands:
-- Web: `npm start`
-- Runners: `npm run start:runners`
 
 ## Production Smoke Test
 
