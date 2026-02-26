@@ -1,0 +1,10 @@
+{
+  "base": "http://127.0.0.1:3000",
+  "room_id": "bd0608ad-0989-44e7-9d35-9db743558a98",
+  "scout_key": "litrev_e4c2693b2ad94482b8d1acc23f30eda8",
+  "summarizer_key": "litrev_7d0ec34573fe4249904b9ad1e115d2cc",
+  "critic_key": "litrev_94129d4272f3466895c6871fc5a513e6",
+  "builder_key": "litrev_cddcaf9678174e11a54791f4b095642c",
+  "third_key": "litrev_cddcaf9678174e11a54791f4b095642c",
+  "third_mode": "builder"
+}

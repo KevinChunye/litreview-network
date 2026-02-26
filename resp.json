@@ -1,0 +1,15 @@
+{
+  "success": true,
+  "data": {
+    "paper_id": "40d2732a-138f-4d19-b3c6-205890facbed",
+    "title": "ReAct: Synergizing Reasoning and Acting in Language Models",
+    "abstract": "Abstract:While large language models (LLMs) have demonstrated impressive capabilities across tasks in language understanding and interactive decision making, their abilities for reasoning (e.g. chain-of-thought prompting) and acting (e.g. action plan generation) have primarily been studied as separate topics. In this paper, we explore the use of LLMs to generate both reasoning traces and task-specific actions in an interleaved manner, allowing for greater synergy between the two: reasoning traces help the model induce, track, and update action plans as well as handle exceptions, while actions allow it to interface with external sources, such as knowledge bases or environments, to gather additional information. We apply our approach, named ReAct, to a diverse set of language and decision making tasks and demonstrate its effectiveness over state-of-the-art baselines, as well as improved hu",
+    "snippets": [
+      "ReAct: Synergizing Reasoning and Acting in Language Models\nAbstract:While large language models (LLMs) have demonstrated impressive capabilities across tasks in language understanding and interactive decision making, their abilities for reasoning (e.g. chain-of-thought prompting) and acting (e.g. action plan generation) have primarily been studied as separate topics. In this paper, we explore the",
+      "use of LLMs to generate both reasoning traces and task-specific actions in an interleaved manner, allowing for greater synergy between the two: reasoning traces help the model induce, track, and update action plans as well as handle exceptions, while actions allow it to interface with external sources, such as knowledge bases or environments, to gather additional information. We apply our",
+      "approach, named ReAct, to a diverse set of language and decision making tasks and demonstrate its effectiveness over state-of-the-art baselines, as well as improved hu\nAuthors:Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik Narasimhan, Yuan Cao\n\n \n \n Computer Science > Computation and Language\n \n\n \n arXiv:2210.03629 (cs)\n \n\n \n \n [Submitted on 6 Oct 2022 (v1), last revised 10 Mar",
+      "2023 (this version, v3)]\n Title:ReAct: Synergizing Reasoning and Acting in Language Models\n Authors:Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik Narasimhan, Yuan Cao View a PDF of the paper titled ReAct: Synergizing Reasoning and Acting in Language Models, by Shunyu Yao and 6 other authors\n View PDF\n\n \n Abstract:While large language models (LLMs) have demonstrated impressive",
+      "capabilities across tasks in language understanding and interactive decision making, their abilities for reasoning (e.g. chain-of-thought prompting) and acting (e.g. action plan generation) have primarily been studied as separate topics. In this paper, we explore the use of LLMs to generate both reasoning traces and task-specific actions in an interleaved manner, allowing for greater synergy"
+    ]
+  }
+}

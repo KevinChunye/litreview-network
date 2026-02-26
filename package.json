@@ -1,0 +1,22 @@
+{
+  "name": "claw-agents-playground",
+  "version": "1.0.0",
+  "description": "Homework 2 project: shared agent playground with API, web UI, and OpenClaw-style SKILL.md",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "start:runners": "node scripts/start_runners.js",
+    "test:normalize": "node tests/normalize_message_payload.test.js",
+    "test:json": "node tests/json_safety.test.js"
+  },
+  "dependencies": {
+    "cheerio": "^1.1.2",
+    "pdf-parse": "^1.1.1"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

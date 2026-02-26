@@ -1,0 +1,126 @@
+services:
+  web:
+    build: .
+    container_name: litreview-web
+    command: npm start
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HOST: 0.0.0.0
+      APP_URL: ${APP_URL:-http://localhost:3000}
+      STORE_PATH: ${STORE_PATH:-/app/data/store.json}
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  runner-scout:
+    build: .
+    container_name: litreview-runner-scout
+    command: sh -lc "node scripts/run_mode_from_session.js 2>&1 | tee -a /app/logs/runner-scout.log"
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      MODE: scout
+      BASE: http://web:3000
+      SESSION_PATH: /tmp/litrev-session.json
+      SESSION_BOOTSTRAP: "1"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_ENABLE_WEB_SEARCH: ${OPENAI_ENABLE_WEB_SEARCH:-1}
+      AUTO_INGEST_URLS: ${AUTO_INGEST_URLS:-1}
+      DEMO_MODE: ${DEMO_MODE:-1}
+      POLL_SECONDS: ${POLL_SECONDS:-1}
+      MIN_SECONDS_BETWEEN_POSTS: ${MIN_SECONDS_BETWEEN_POSTS:-2}
+      MOCK_OPENAI: ${MOCK_OPENAI:-0}
+    volumes:
+      - ./logs:/app/logs
+      - litreview-session:/tmp
+
+  runner-summarizer:
+    build: .
+    container_name: litreview-runner-summarizer
+    command: sh -lc "node scripts/run_mode_from_session.js 2>&1 | tee -a /app/logs/runner-summarizer.log"
+    depends_on:
+      web:
+        condition: service_healthy
+      runner-scout:
+        condition: service_started
+    environment:
+      MODE: summarizer
+      BASE: http://web:3000
+      SESSION_PATH: /tmp/litrev-session.json
+      SESSION_BOOTSTRAP: "0"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_ENABLE_WEB_SEARCH: ${OPENAI_ENABLE_WEB_SEARCH:-1}
+      AUTO_INGEST_URLS: ${AUTO_INGEST_URLS:-1}
+      DEMO_MODE: ${DEMO_MODE:-1}
+      POLL_SECONDS: ${POLL_SECONDS:-1}
+      MIN_SECONDS_BETWEEN_POSTS: ${MIN_SECONDS_BETWEEN_POSTS:-2}
+      MOCK_OPENAI: ${MOCK_OPENAI:-0}
+    volumes:
+      - ./logs:/app/logs
+      - litreview-session:/tmp
+
+  runner-critic:
+    build: .
+    container_name: litreview-runner-critic
+    command: sh -lc "node scripts/run_mode_from_session.js 2>&1 | tee -a /app/logs/runner-critic.log"
+    depends_on:
+      web:
+        condition: service_healthy
+      runner-scout:
+        condition: service_started
+    environment:
+      MODE: critic
+      BASE: http://web:3000
+      SESSION_PATH: /tmp/litrev-session.json
+      SESSION_BOOTSTRAP: "0"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_ENABLE_WEB_SEARCH: ${OPENAI_ENABLE_WEB_SEARCH:-1}
+      AUTO_INGEST_URLS: ${AUTO_INGEST_URLS:-1}
+      DEMO_MODE: ${DEMO_MODE:-1}
+      POLL_SECONDS: ${POLL_SECONDS:-1}
+      MIN_SECONDS_BETWEEN_POSTS: ${MIN_SECONDS_BETWEEN_POSTS:-2}
+      MOCK_OPENAI: ${MOCK_OPENAI:-0}
+    volumes:
+      - ./logs:/app/logs
+      - litreview-session:/tmp
+
+  runner-builder:
+    build: .
+    container_name: litreview-runner-builder
+    command: sh -lc "node scripts/run_mode_from_session.js 2>&1 | tee -a /app/logs/runner-builder.log"
+    depends_on:
+      web:
+        condition: service_healthy
+      runner-scout:
+        condition: service_started
+    environment:
+      MODE: builder
+      BASE: http://web:3000
+      SESSION_PATH: /tmp/litrev-session.json
+      SESSION_BOOTSTRAP: "0"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_ENABLE_WEB_SEARCH: ${OPENAI_ENABLE_WEB_SEARCH:-1}
+      AUTO_INGEST_URLS: ${AUTO_INGEST_URLS:-1}
+      DEMO_MODE: ${DEMO_MODE:-1}
+      POLL_SECONDS: ${POLL_SECONDS:-1}
+      MIN_SECONDS_BETWEEN_POSTS: ${MIN_SECONDS_BETWEEN_POSTS:-2}
+      MOCK_OPENAI: ${MOCK_OPENAI:-0}
+    volumes:
+      - ./logs:/app/logs
+      - litreview-session:/tmp
+
+volumes:
+  litreview-session:
