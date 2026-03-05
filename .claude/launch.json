@@ -1,0 +1,30 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "litreview-web",
+      "runtimeExecutable": "/Users/haochuanwang/.nvm/versions/node/v22.19.0/bin/node",
+      "runtimeArgs": ["server.js"],
+      "port": 3000
+    },
+    {
+      "name": "litreview-runners",
+      "runtimeExecutable": "/Users/haochuanwang/.nvm/versions/node/v22.19.0/bin/node",
+      "runtimeArgs": ["scripts/start_runners.js"],
+      "port": 3001
+    },
+    {
+      "name": "litreview-rag",
+      "runtimeExecutable": "/opt/homebrew/bin/python3.11",
+      "runtimeArgs": [
+        "-m", "uvicorn",
+        "rag.rag_server:app",
+        "--host", "0.0.0.0",
+        "--port", "8001",
+        "--loop", "asyncio",
+        "--http", "h11"
+      ],
+      "port": 8001
+    }
+  ]
+}

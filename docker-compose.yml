@@ -27,16 +27,17 @@ services:
   runner-scout:
     build: .
     container_name: litreview-runner-scout
-    command: sh -lc "node scripts/run_mode_from_session.js 2>&1 | tee -a /app/logs/runner-scout.log"
+    command: sh -lc "node scripts/agent_runner.js 2>&1 | tee -a /app/logs/runner-scout.log"
     depends_on:
       web:
         condition: service_healthy
     environment:
       MODE: scout
+      RUNNER_ID: runner-scout-docker
       BASE: http://web:3000
-      SESSION_PATH: /tmp/litrev-session.json
-      SESSION_BOOTSTRAP: "1"
+      LITREV_API_KEY: ${LITREV_SCOUT_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       OPENAI_ENABLE_WEB_SEARCH: ${OPENAI_ENABLE_WEB_SEARCH:-1}
       AUTO_INGEST_URLS: ${AUTO_INGEST_URLS:-1}
       DEMO_MODE: ${DEMO_MODE:-1}
@@ -45,12 +46,11 @@ services:
       MOCK_OPENAI: ${MOCK_OPENAI:-0}
     volumes:
       - ./logs:/app/logs
-      - litreview-session:/tmp
 
   runner-summarizer:
     build: .
     container_name: litreview-runner-summarizer
-    command: sh -lc "node scripts/run_mode_from_session.js 2>&1 | tee -a /app/logs/runner-summarizer.log"
+    command: sh -lc "node scripts/agent_runner.js 2>&1 | tee -a /app/logs/runner-summarizer.log"
     depends_on:
       web:
         condition: service_healthy
@@ -58,10 +58,11 @@ services:
         condition: service_started
     environment:
       MODE: summarizer
+      RUNNER_ID: runner-summarizer-docker
       BASE: http://web:3000
-      SESSION_PATH: /tmp/litrev-session.json
-      SESSION_BOOTSTRAP: "0"
+      LITREV_API_KEY: ${LITREV_SUMMARIZER_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       OPENAI_ENABLE_WEB_SEARCH: ${OPENAI_ENABLE_WEB_SEARCH:-1}
       AUTO_INGEST_URLS: ${AUTO_INGEST_URLS:-1}
       DEMO_MODE: ${DEMO_MODE:-1}
@@ -70,12 +71,11 @@ services:
       MOCK_OPENAI: ${MOCK_OPENAI:-0}
     volumes:
       - ./logs:/app/logs
-      - litreview-session:/tmp
 
   runner-critic:
     build: .
     container_name: litreview-runner-critic
-    command: sh -lc "node scripts/run_mode_from_session.js 2>&1 | tee -a /app/logs/runner-critic.log"
+    command: sh -lc "node scripts/agent_runner.js 2>&1 | tee -a /app/logs/runner-critic.log"
     depends_on:
       web:
         condition: service_healthy
@@ -83,10 +83,11 @@ services:
         condition: service_started
     environment:
       MODE: critic
+      RUNNER_ID: runner-critic-docker
       BASE: http://web:3000
-      SESSION_PATH: /tmp/litrev-session.json
-      SESSION_BOOTSTRAP: "0"
+      LITREV_API_KEY: ${LITREV_CRITIC_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       OPENAI_ENABLE_WEB_SEARCH: ${OPENAI_ENABLE_WEB_SEARCH:-1}
       AUTO_INGEST_URLS: ${AUTO_INGEST_URLS:-1}
       DEMO_MODE: ${DEMO_MODE:-1}
@@ -95,12 +96,11 @@ services:
       MOCK_OPENAI: ${MOCK_OPENAI:-0}
     volumes:
       - ./logs:/app/logs
-      - litreview-session:/tmp
 
   runner-builder:
     build: .
     container_name: litreview-runner-builder
-    command: sh -lc "node scripts/run_mode_from_session.js 2>&1 | tee -a /app/logs/runner-builder.log"
+    command: sh -lc "node scripts/agent_runner.js 2>&1 | tee -a /app/logs/runner-builder.log"
     depends_on:
       web:
         condition: service_healthy
@@ -108,10 +108,11 @@ services:
         condition: service_started
     environment:
       MODE: builder
+      RUNNER_ID: runner-builder-docker
       BASE: http://web:3000
-      SESSION_PATH: /tmp/litrev-session.json
-      SESSION_BOOTSTRAP: "0"
+      LITREV_API_KEY: ${LITREV_BUILDER_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       OPENAI_ENABLE_WEB_SEARCH: ${OPENAI_ENABLE_WEB_SEARCH:-1}
       AUTO_INGEST_URLS: ${AUTO_INGEST_URLS:-1}
       DEMO_MODE: ${DEMO_MODE:-1}
@@ -120,7 +121,55 @@ services:
       MOCK_OPENAI: ${MOCK_OPENAI:-0}
     volumes:
       - ./logs:/app/logs
-      - litreview-session:/tmp
 
-volumes:
-  litreview-session:
+  runner-curator:
+    build: .
+    container_name: litreview-runner-curator
+    command: sh -lc "node scripts/agent_runner.js 2>&1 | tee -a /app/logs/runner-curator.log"
+    depends_on:
+      web:
+        condition: service_healthy
+      runner-summarizer:
+        condition: service_started
+      runner-critic:
+        condition: service_started
+    environment:
+      MODE: curator
+      RUNNER_ID: runner-curator-docker
+      BASE: http://web:3000
+      LITREV_API_KEY: ${LITREV_CURATOR_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENAI_ENABLE_WEB_SEARCH: ${OPENAI_ENABLE_WEB_SEARCH:-0}
+      AUTO_INGEST_URLS: ${AUTO_INGEST_URLS:-1}
+      DEMO_MODE: ${DEMO_MODE:-1}
+      POLL_SECONDS: ${POLL_SECONDS:-1}
+      MIN_SECONDS_BETWEEN_POSTS: ${MIN_SECONDS_BETWEEN_POSTS:-2}
+      MOCK_OPENAI: ${MOCK_OPENAI:-0}
+    volumes:
+      - ./logs:/app/logs
+
+  runner-writer:
+    build: .
+    container_name: litreview-runner-writer
+    command: sh -lc "node scripts/agent_runner.js 2>&1 | tee -a /app/logs/runner-writer.log"
+    depends_on:
+      web:
+        condition: service_healthy
+      runner-curator:
+        condition: service_started
+    environment:
+      MODE: writer
+      RUNNER_ID: runner-writer-docker
+      BASE: http://web:3000
+      LITREV_API_KEY: ${LITREV_WRITER_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENAI_ENABLE_WEB_SEARCH: ${OPENAI_ENABLE_WEB_SEARCH:-0}
+      AUTO_INGEST_URLS: ${AUTO_INGEST_URLS:-1}
+      DEMO_MODE: ${DEMO_MODE:-1}
+      POLL_SECONDS: ${POLL_SECONDS:-1}
+      MIN_SECONDS_BETWEEN_POSTS: ${MIN_SECONDS_BETWEEN_POSTS:-2}
+      MOCK_OPENAI: ${MOCK_OPENAI:-0}
+    volumes:
+      - ./logs:/app/logs

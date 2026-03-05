@@ -3,46 +3,84 @@ const STORAGE_IDENTITIES_KEY = 'litreview_identities_v1';
 const STORAGE_ACTIVE_KEY = 'litreview_active_key';
 const STORAGE_ROOMS_SIDEBAR_KEY = 'litreview_rooms_sidebar_v1';
 const POLL_MS = 10000;
+const RUNNER_SUGGESTION_DEFAULT =
+  'No runners are attached to this room. Click Attach runners to this room.';
 
 const state = {
   identities: [],
   activeKey: '',
   currentAgentId: '',
-  activeView: 'agent',
+  activeView: 'dashboard',
   rooms: [],
   selectedRoomId: '',
   messages: [],
+  runners: [],
   replyToPinned: false,
   papers: [],
   selectedPaperId: '',
   selectedSnippetIds: [],
+  availableAgents: [],
+  recommendedAgents: [],
+  draftRoomAgentIds: [],
+  paperSearch: '',
+  paperDiscussedFilter: 'all',
   registration: null,
   roomPollTimer: null,
+  demoMode: false,
+  mockOpenAI: false,
+  agentDirShowAll: false,
   roomsSidebar: {
     collapsed: false,
     widthPct: 28,
     isResizing: false,
   },
+  // Paper Feed
+  feed: {
+    topic: 'transformer attention mechanisms',
+    items: [],
+    lastRefreshed: null,
+    activeItem: null, // currently open in drawer
+  },
 };
 
 const el = {
-  baseUrl: document.querySelector('#base-url'),
   identitySelect: document.querySelector('#identity-select'),
   activeKeyInput: document.querySelector('#active-key-input'),
   setKeyBtn: document.querySelector('#set-key-btn'),
   copyKeyBtn: document.querySelector('#copy-key-btn'),
   removeKeyBtn: document.querySelector('#remove-key-btn'),
   missingKeyBanner: document.querySelector('#missing-key-banner'),
+  setupPanel: document.querySelector('#setup-panel'),
+  setupModeNote: document.querySelector('#setup-mode-note'),
   errorPanel: document.querySelector('#error-panel'),
   errorContent: document.querySelector('#error-content'),
   errorClose: document.querySelector('#error-close'),
 
   navButtons: [...document.querySelectorAll('.nav-btn')],
   views: {
+    dashboard: document.querySelector('#view-dashboard'),
     agent: document.querySelector('#view-agent'),
     rooms: document.querySelector('#view-rooms'),
     papers: document.querySelector('#view-papers'),
+    feed: document.querySelector('#view-feed'),
   },
+
+  // Feed elements
+  feedTopicInput: document.querySelector('#feed-topic-input'),
+  feedRefreshBtn: document.querySelector('#feed-refresh-btn'),
+  feedLastRefreshed: document.querySelector('#feed-last-refreshed'),
+  feedCards: document.querySelector('#feed-cards'),
+  feedDrawerBackdrop: document.querySelector('#feed-drawer-backdrop'),
+  feedDrawerTitle: document.querySelector('#feed-drawer-title'),
+  feedDrawerClose: document.querySelector('#feed-drawer-close'),
+  feedDrawerMeta: document.querySelector('#feed-drawer-meta'),
+  feedDrawerLinks: document.querySelector('#feed-drawer-links'),
+  feedDrawerTldr: document.querySelector('#feed-drawer-tldr'),
+  feedDrawerWhy: document.querySelector('#feed-drawer-why'),
+  feedDrawerAbstract: document.querySelector('#feed-drawer-abstract'),
+  feedRoomSelect: document.querySelector('#feed-room-select'),
+  feedRoleSelect: document.querySelector('#feed-role-select'),
+  feedSendBtn: document.querySelector('#feed-send-btn'),
 
   registerForm: document.querySelector('#register-form'),
   regApiKey: document.querySelector('#reg-api-key'),
@@ -56,6 +94,9 @@ const el = {
   refreshRoomsBtn: document.querySelector('#refresh-rooms-btn'),
   roomsPollToggle: document.querySelector('#rooms-poll-toggle'),
   createRoomForm: document.querySelector('#create-room-form'),
+  createRoomAgentOptions: document.querySelector('#create-room-agent-options'),
+  agentsShowAllToggle: document.querySelector('#agents-show-all-toggle'),
+  agentsShowLegacyToggle: document.querySelector('#agents-show-legacy-toggle'),
   roomsLayout: document.querySelector('#rooms-layout'),
   roomsSidebar: document.querySelector('#rooms-sidebar'),
   roomsSidebarToggle: document.querySelector('#rooms-sidebar-toggle'),
@@ -63,6 +104,14 @@ const el = {
   roomsList: document.querySelector('#rooms-list'),
   roomTitle: document.querySelector('#room-title'),
   roomMeta: document.querySelector('#room-meta'),
+  roomRoster: document.querySelector('#room-roster'),
+  attachRunnersBtn: document.querySelector('#attach-runners-btn'),
+  attachRunnersMode: document.querySelector('#attach-runners-mode'),
+  runnerAttachStatus: document.querySelector('#runner-attach-status'),
+  runnerSuggestion: document.querySelector('#runner-suggestion'),
+  roomLinkedPapers: document.querySelector('#room-linked-papers'),
+  suggestedPromptSelect: document.querySelector('#suggested-prompt-select'),
+  applySuggestedPromptBtn: document.querySelector('#apply-suggested-prompt-btn'),
   messagesThread: document.querySelector('#messages-thread'),
   messageForm: document.querySelector('#message-form'),
   composerCard: document.querySelector('#composer-card'),
@@ -76,6 +125,9 @@ const el = {
 
   ingestForm: document.querySelector('#ingest-form'),
   refreshPapersBtn: document.querySelector('#refresh-papers-btn'),
+  papersSearchForm: document.querySelector('#papers-search-form'),
+  papersSearchInput: document.querySelector('#papers-search-input'),
+  papersFilterSelect: document.querySelector('#papers-filter-select'),
   papersList: document.querySelector('#papers-list'),
   paperDetail: document.querySelector('#paper-detail'),
 };
@@ -87,6 +139,16 @@ function escapeHtml(value) {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#039;');
+}
+
+// Shorten auto-generated runner names for display.
+// "runner-scout-1772572338195-12754d12" → "scout"
+// "runner-summarizer-1772052264"        → "summarizer"
+// "critic-kev"                          → "critic-kev"  (already short)
+function shortAgentName(name) {
+  if (!name) return 'agent';
+  const m = name.match(/^runner-([a-z]+(?:-[a-z]+)*)-\d{7,}/);
+  return m ? m[1] : name;
 }
 
 function applyInlineMarkdown(value) {
@@ -362,6 +424,14 @@ function renderIdentitySelect() {
 
 function setError(message, details = {}) {
   const status = details.status !== undefined && details.status !== null ? String(details.status) : 'unknown';
+  if (String(status) === '401') {
+    clearError();
+    renderSetupPanel({
+      reason: state.demoMode || state.mockOpenAI ? 'demo' : !state.activeKey ? 'missing_key' : 'invalid_key',
+      message: message || (!state.activeKey ? 'API key required.' : 'Invalid API key.'),
+    });
+    return;
+  }
   const hint = details.hint ? String(details.hint) : '';
   const lines = [`Error (${status}): ${message || 'Request failed.'}`];
   if (hint) lines.push(`Hint: ${hint}`);
@@ -382,9 +452,37 @@ function clearError() {
   el.errorPanel.classList.add('hidden');
 }
 
+function renderSetupPanel(context = {}) {
+  if (!el.setupPanel) return;
+  const reason = String(context.reason || '').trim();
+  const customMessage = String(context.message || '').trim();
+  // Only show the detailed setup panel on the Agent view; other views show just the compact banner.
+  const onAgentView = state.activeView === 'agent';
+  if (state.demoMode || state.mockOpenAI || reason === 'demo') {
+    el.setupModeNote.textContent = 'Demo mode enabled. You can explore UI flows without treating missing auth as a hard error.';
+    el.setupPanel.classList.toggle('hidden', !onAgentView);
+    return;
+  }
+  if (!state.activeKey || reason === 'missing_key') {
+    el.setupModeNote.textContent =
+      customMessage ||
+      'API key required. Register an agent in Agent tab, then paste/set the key in Identity panel.';
+    el.setupPanel.classList.toggle('hidden', !onAgentView);
+    return;
+  }
+  if (reason === 'invalid_key') {
+    el.setupModeNote.textContent =
+      customMessage || 'The active API key was rejected. Paste a valid key or register a new agent.';
+    el.setupPanel.classList.toggle('hidden', !onAgentView);
+    return;
+  }
+  el.setupPanel.classList.add('hidden');
+}
+
 function updateProtectedUi() {
   const hasKey = Boolean(state.activeKey);
   el.missingKeyBanner.classList.toggle('hidden', hasKey);
+  renderSetupPanel({ reason: hasKey ? '' : 'missing_key' });
 
   const protectedNodes = [...document.querySelectorAll('[data-requires-auth]')];
   for (const node of protectedNodes) {
@@ -562,6 +660,185 @@ async function refreshAgentStatus() {
   updatePostButtonState();
 }
 
+async function refreshAvailableAgents() {
+  let recommended = [];
+  try {
+    const recommendedData = await apiRequest('/api/agents?recommended=1');
+    recommended = Array.isArray(recommendedData.agents) ? recommendedData.agents : [];
+  } catch (_) {
+    recommended = [];
+  }
+  const allData = await apiRequest('/api/agents?include_archived=1');
+  state.availableAgents = Array.isArray(allData.agents) ? allData.agents : [];
+  state.recommendedAgents = recommended;
+  renderCreateRoomAgentOptions();
+}
+
+async function refreshRunners() {
+  const data = await apiRequest('/api/runners');
+  state.runners = Array.isArray(data.runners) ? data.runners : [];
+  updateRunnerAttachStatus();
+}
+
+function currentRoomAttachedRunners() {
+  if (!state.selectedRoomId) return [];
+  return state.runners.filter((runner) => runner.assigned_room_id === state.selectedRoomId);
+}
+
+function updateRunnerAttachStatus() {
+  if (!el.runnerAttachStatus) return;
+  const attachedAll = currentRoomAttachedRunners();
+  const attachedOnline = attachedAll.filter((runner) => runner.online);
+  if (attachedOnline.length) {
+    el.runnerAttachStatus.textContent = `Runners attached: ✅ (${attachedOnline.length})`;
+    el.runnerAttachStatus.classList.remove('badge-note');
+    el.runnerAttachStatus.classList.add('badge-summary');
+  } else if (attachedAll.length) {
+    el.runnerAttachStatus.textContent = 'Runners mapped, but offline: ⚠️';
+    el.runnerAttachStatus.classList.remove('badge-summary');
+    el.runnerAttachStatus.classList.add('badge-note');
+  } else {
+    el.runnerAttachStatus.textContent = 'No runners attached: ⚠️';
+    el.runnerAttachStatus.classList.remove('badge-summary');
+    el.runnerAttachStatus.classList.add('badge-note');
+  }
+}
+
+function parseDateMs(value) {
+  const t = new Date(value || '').getTime();
+  return Number.isFinite(t) ? t : 0;
+}
+
+function agentMatchesCapability(agent, capability) {
+  const tags = Array.isArray(agent.tags) ? agent.tags.map((tag) => String(tag || '').toLowerCase()) : [];
+  const text = `${agent.name || ''} ${agent.description || ''}`.toLowerCase();
+  if (capability === 'scout') return tags.includes('scout') || /scout|retriev|finder/.test(text);
+  if (capability === 'summarizer') return tags.includes('summarizer') || /summary|summariz/.test(text);
+  if (capability === 'critic') return tags.includes('critic') || /critic|critique|review/.test(text);
+  if (capability === 'connector') return tags.includes('connector') || /connector|related|librarian/.test(text);
+  if (capability === 'comparator') return tags.includes('comparator') || /compare|comparator|versus|vs\b/.test(text);
+  if (capability === 'builder') return tags.includes('builder') || /builder|experiment|implement/.test(text);
+  return false;
+}
+
+function oneLineDescription(agent, fallback) {
+  const desc = String(agent.description || '').trim();
+  return desc || fallback;
+}
+
+function selectedRoomAgentIds() {
+  const fromState = Array.isArray(state.draftRoomAgentIds) ? state.draftRoomAgentIds : [];
+  const fromDom = [...document.querySelectorAll('#create-room-form input[name="agent_ids"]:checked')]
+    .map((node) => String(node.value || '').trim())
+    .filter(Boolean);
+  return [...new Set([...fromState, ...fromDom])];
+}
+
+function renderCreateRoomAgentOptions() {
+  if (!el.createRoomAgentOptions) return;
+  if (!state.availableAgents.length) {
+    el.createRoomAgentOptions.innerHTML =
+      '<div class="small">No agents yet. Register at least one agent first.</div>';
+    return;
+  }
+  const selectedIds = new Set(selectedRoomAgentIds());
+  state.draftRoomAgentIds = [...selectedIds];
+
+  const showAll = Boolean(el.agentsShowAllToggle && el.agentsShowAllToggle.checked);
+  const showLegacy = Boolean(el.agentsShowLegacyToggle && el.agentsShowLegacyToggle.checked);
+  const nowMs = Date.now();
+  const recentCutoff = nowMs - 24 * 60 * 60 * 1000;
+
+  const allSorted = [...state.availableAgents].sort(
+    (a, b) => parseDateMs(b.created_at) - parseDateMs(a.created_at),
+  );
+  const defaultPool = allSorted.filter((agent) => {
+    if (showLegacy) return true;
+    const recent = parseDateMs(agent.created_at) >= recentCutoff;
+    const recommended = Boolean(agent.recommended) || (Array.isArray(agent.tags) && agent.tags.includes('recommended'));
+    const archived = Boolean(agent.archived);
+    return !archived && (recommended || recent);
+  });
+
+  const recommendedPool = (state.recommendedAgents.length ? state.recommendedAgents : defaultPool).sort(
+    (a, b) => parseDateMs(b.created_at) - parseDateMs(a.created_at),
+  );
+  const capabilityDefs = [
+    ['scout', 'Scout', 'Find/recommend foundational + recent papers.'],
+    ['summarizer', 'Summarizer', 'Produce structured evidence-grounded summaries.'],
+    ['critic', 'Critic', 'Identify limitations, confounds, and ablations.'],
+    ['connector', 'Connector', 'Find related work and connect paper clusters.'],
+    ['comparator', 'Comparator', 'Compare Paper A vs B with decision guidance.'],
+    ['builder', 'Builder', 'Propose experiments and implementation next steps.'],
+  ];
+  const usedIds = new Set();
+  const curatedCards = capabilityDefs
+    .map(([capability, label, fallback]) => {
+      const candidate = recommendedPool.find((agent) => {
+        if (!agent.agent_id || usedIds.has(agent.agent_id)) return false;
+        return agentMatchesCapability(agent, capability);
+      });
+      if (!candidate) {
+        return `
+          <div class="agent-check">
+            <span><strong>${escapeHtml(label)}</strong><div class="small">${escapeHtml(fallback)} (not available yet)</div></span>
+          </div>
+        `;
+      }
+      usedIds.add(candidate.agent_id);
+      const checked = selectedIds.has(candidate.agent_id) ? 'checked' : '';
+      return `
+        <label class="agent-check">
+          <input type="checkbox" name="agent_ids" value="${escapeHtml(candidate.agent_id)}" ${checked} />
+          <span>
+            <strong>${escapeHtml(shortAgentName(candidate.name || label))}</strong>
+            <div class="small">${escapeHtml(oneLineDescription(candidate, fallback))}</div>
+            <details class="small">
+              <summary>Details</summary>
+              <div class="mono">ID: ${escapeHtml(candidate.agent_id)}</div>
+              <div>Tags: ${escapeHtml((candidate.tags || []).join(', ') || 'none')}</div>
+            </details>
+          </span>
+        </label>
+      `;
+    })
+    .join('');
+
+  let allAgentsHtml = '';
+  if (showAll) {
+    const legacyPool = defaultPool.filter((agent) => !usedIds.has(agent.agent_id));
+    allAgentsHtml = `
+      <div class="agent-section-title">All agents</div>
+      ${legacyPool
+        .map((agent) => {
+          const checked = selectedIds.has(agent.agent_id) ? 'checked' : '';
+          return `
+            <label class="agent-check">
+              <input type="checkbox" name="agent_ids" value="${escapeHtml(agent.agent_id)}" ${checked} />
+              <span>
+                <strong>${escapeHtml(shortAgentName(agent.name || 'agent'))}</strong>
+                <div class="small">${escapeHtml(oneLineDescription(agent, 'No description'))}</div>
+                <details class="small">
+                  <summary>Details</summary>
+                  <div class="mono">ID: ${escapeHtml(agent.agent_id)}</div>
+                  <div>Tags: ${escapeHtml((agent.tags || []).join(', ') || 'none')}</div>
+                  <div>Created: ${escapeHtml(formatDate(agent.created_at))}</div>
+                </details>
+              </span>
+            </label>
+          `;
+        })
+        .join('')}
+    `;
+  }
+
+  el.createRoomAgentOptions.innerHTML = `
+    <div class="agent-section-title">Recommended agents</div>
+    ${curatedCards}
+    ${allAgentsHtml}
+  `;
+}
+
 function getRoomById(roomId) {
   return state.rooms.find((room) => room.id === roomId) || null;
 }
@@ -583,6 +860,46 @@ function clearReplyTarget() {
   el.replyToInput.value = '';
   state.replyToPinned = false;
   updateReplyPinnedIndicator();
+}
+
+function suggestedPromptText(kind, room) {
+  const topic = room && room.topic ? room.topic : '<topic>';
+  if (kind === 'recommend') return `Recommend papers on ${topic}. Return 5 foundational + 5 recent with reason.`;
+  if (kind === 'summarize_top3') return 'Summarize the top 3 papers with TL;DR, method, experiments, and results.';
+  if (kind === 'critique_paper') return 'Critique paper PAPER_ID: list limitations, missing baselines, and decisive ablations.';
+  if (kind === 'compare') {
+    return 'Compare PAPER_A vs PAPER_B in a table: problem framing, method, data, metrics, strengths, weaknesses, and when to use which.';
+  }
+  return '';
+}
+
+function showRunnerSuggestion(show) {
+  if (!el.runnerSuggestion) return;
+  el.runnerSuggestion.classList.toggle('hidden', !show);
+}
+
+function setRunnerSuggestionMessage(message) {
+  if (!el.runnerSuggestion) return;
+  el.runnerSuggestion.textContent = String(message || RUNNER_SUGGESTION_DEFAULT);
+}
+
+async function scheduleRunnerReplyHint(roomId) {
+  const checkDelayMs = Number(window.localStorage.getItem('runner_hint_delay_ms') || 15000);
+  window.setTimeout(async () => {
+    if (!roomId) return;
+    try {
+      await refreshRunners();
+      const attached = state.runners.filter((runner) => runner.assigned_room_id === roomId);
+      if (!attached.length) {
+        setRunnerSuggestionMessage(RUNNER_SUGGESTION_DEFAULT);
+        showRunnerSuggestion(true);
+      } else {
+        showRunnerSuggestion(false);
+      }
+    } catch (_) {
+      // Ignore hint checks when auth/context unavailable.
+    }
+  }, Math.max(3000, checkDelayMs));
 }
 
 function ensureReplyTargetControls() {
@@ -630,6 +947,13 @@ function renderRoomsList() {
       '<div class="card-item small">No rooms yet. Create your first room and invite another agent to collaborate.</div>';
     el.roomTitle.textContent = 'Room Detail';
     el.roomMeta.textContent = 'Create or select a room to start a thread.';
+    if (el.roomRoster) el.roomRoster.innerHTML = '';
+    if (el.roomLinkedPapers) el.roomLinkedPapers.textContent = '';
+    if (el.runnerAttachStatus) {
+      el.runnerAttachStatus.textContent = 'No runners attached: ⚠️';
+      el.runnerAttachStatus.classList.remove('badge-summary');
+      el.runnerAttachStatus.classList.add('badge-note');
+    }
     el.messagesThread.innerHTML = '<div class="small">No thread yet. Choose a room and post a structured message.</div>';
     updateReplyPinnedIndicator();
     return;
@@ -647,6 +971,11 @@ function renderRoomsList() {
           <div><strong>${escapeHtml(room.topic || 'Untitled room')}</strong></div>
           <div class="small">Created: ${escapeHtml(formatDate(room.created_at))}</div>
           <div class="small">Messages: ${escapeHtml(room.message_count || 0)} · Last: ${escapeHtml(formatDate(room.last_message_at))}</div>
+          <div class="small">Agents: ${
+            Array.isArray(room.agent_names) && room.agent_names.length
+              ? escapeHtml(room.agent_names.map(shortAgentName).join(', '))
+              : 'any'
+          }</div>
         </button>
       `;
     })
@@ -682,6 +1011,15 @@ function renderMessages(roomInfo) {
   if (room) {
     el.roomTitle.textContent = room.topic || 'Room Detail';
     el.roomMeta.textContent = `Created ${formatDate(room.created_at)} · ${room.message_count || 0} messages`;
+    const roster = Array.isArray(room.agent_names) ? room.agent_names : [];
+    el.roomRoster.innerHTML = roster.length
+      ? roster.map((name) => `<span class="roster-chip" title="${escapeHtml(name)}">${escapeHtml(shortAgentName(name))}</span>`).join('')
+      : '<span class="small">No fixed roster (any registered agent can post).</span>';
+    const linked = Array.isArray(room.linked_paper_ids) ? room.linked_paper_ids : [];
+    el.roomLinkedPapers.textContent = linked.length
+      ? `Linked papers: ${linked.join(', ')}`
+      : 'Linked papers: none yet (added automatically via citation/ingest).';
+    updateRunnerAttachStatus();
   }
 
   if (!state.messages.length) {
@@ -731,6 +1069,7 @@ function renderMessages(roomInfo) {
 }
 
 async function refreshRoomsAndMessages() {
+  await refreshRunners();
   const roomData = await apiRequest('/api/rooms');
   state.rooms = Array.isArray(roomData.rooms) ? roomData.rooms : [];
   renderRoomsList();
@@ -745,6 +1084,13 @@ async function refreshRoomsAndMessages() {
     if (room) {
       el.roomTitle.textContent = room.topic || 'Room Detail';
       el.roomMeta.textContent = `Created ${formatDate(room.created_at)} · ${room.message_count || 0} messages`;
+      const roster = Array.isArray(room.agent_names) ? room.agent_names : [];
+      el.roomRoster.innerHTML = roster.length
+        ? roster.map((name) => `<span class="roster-chip">${escapeHtml(name)}</span>`).join('')
+        : '<span class="small">No fixed roster.</span>';
+      const linked = Array.isArray(room.linked_paper_ids) ? room.linked_paper_ids : [];
+      el.roomLinkedPapers.textContent = linked.length ? `Linked papers: ${linked.join(', ')}` : 'Linked papers: none yet.';
+      updateRunnerAttachStatus();
     }
     state.messages = [];
     el.messagesThread.innerHTML = '<div class="small">Set API key first to load room messages.</div>';
@@ -772,10 +1118,18 @@ function renderPapersList() {
   el.papersList.innerHTML = state.papers
     .map((paper) => {
       const active = paper.paper_id === state.selectedPaperId ? 'active' : '';
+      const rooms = Array.isArray(paper.rooms) ? paper.rooms : [];
+      const roomText = rooms.length
+        ? rooms.map((room) => room.topic || room.id).join(' · ')
+        : 'No rooms yet';
       return `
         <button class="card-item paper-btn ${active}" data-paper-id="${escapeHtml(paper.paper_id)}">
           <div><strong>${escapeHtml(paper.title || 'Untitled')}</strong></div>
-          <div class="small">${escapeHtml(formatDate(paper.created_at))}</div>
+          <div class="small">${escapeHtml(paper.source || 'unknown source')} · ${escapeHtml(paper.year || 'n/a')}</div>
+          <div class="small mono">${escapeHtml(paper.canonical_url || paper.url || '')}</div>
+          <div class="small">First: ${escapeHtml(formatDate(paper.first_ingested_at || paper.created_at))}</div>
+          <div class="small">Last seen: ${escapeHtml(formatDate(paper.last_seen_at || paper.created_at))}</div>
+          <div class="small">Rooms (${escapeHtml(paper.rooms_count || 0)}): ${escapeHtml(roomText)}</div>
         </button>
       `;
     })
@@ -799,6 +1153,8 @@ function buildSnippetCitation() {
 
 function renderPaperDetail(paper) {
   const snippets = Array.isArray(paper.snippets) ? paper.snippets : [];
+  const rooms = Array.isArray(paper.rooms) ? paper.rooms : [];
+  const related = Array.isArray(paper.related_papers) ? paper.related_papers : [];
   state.selectedSnippetIds = normalizeSnippetSelection(state.selectedSnippetIds, snippets.length);
   const snippetHtml = snippets.length
     ? snippets
@@ -824,8 +1180,36 @@ function renderPaperDetail(paper) {
   el.paperDetail.innerHTML = `
     <div class="card-item">
       <div><strong>${escapeHtml(paper.title || 'Untitled')}</strong></div>
-      <div class="small mono">${escapeHtml(paper.url || '')}</div>
+      <div class="small mono">${escapeHtml(paper.canonical_url || paper.url || '')}</div>
+      <div class="small">Source: ${escapeHtml(paper.source || 'unknown')} · ${escapeHtml(paper.venue || 'n/a')} · ${escapeHtml(paper.year || 'n/a')}</div>
+      <div class="small">First ingested: ${escapeHtml(formatDate(paper.first_ingested_at || paper.created_at))}</div>
+      <div class="small">Last seen: ${escapeHtml(formatDate(paper.last_seen_at || paper.created_at))}</div>
       <p class="small" style="white-space:pre-wrap;">${escapeHtml(paper.abstract || 'No abstract available.')}</p>
+      <div class="small" style="margin-top:0.45rem;">Discussed in rooms:</div>
+      <div class="actions" style="margin-top:0.3rem;">
+        ${
+          rooms.length
+            ? rooms
+                .map(
+                  (room) =>
+                    `<button type="button" class="btn btn-ghost paper-room-link" data-room-id="${escapeHtml(
+                      room.id || '',
+                    )}">${escapeHtml(room.topic || room.id)}</button>`,
+                )
+                .join('')
+            : '<span class="small">None yet</span>'
+        }
+      </div>
+      <div class="small" style="margin-top:0.45rem;">Related papers:</div>
+      <div class="small">
+        ${
+          related.length
+            ? related
+                .map((item) => `${item.title || item.paper_id} (${item.paper_id})`)
+                .join(' · ')
+            : 'None yet'
+        }
+      </div>
       <div class="actions" style="margin-top:0.6rem;">
         <button class="insert-selected-citation-btn" type="button" data-requires-auth="true">Insert citation</button>
       </div>
@@ -836,7 +1220,9 @@ function renderPaperDetail(paper) {
 }
 
 async function refreshPapers() {
-  const listData = await apiRequest('/api/papers', { auth: true });
+  const query = encodeURIComponent(state.paperSearch || '');
+  const discussed = encodeURIComponent(state.paperDiscussedFilter || 'all');
+  const listData = await apiRequest(`/api/papers?q=${query}&discussed=${discussed}`, { auth: true });
   state.papers = Array.isArray(listData.papers) ? listData.papers : [];
   renderPapersList();
 
@@ -844,6 +1230,103 @@ async function refreshPapers() {
 
   const detailData = await apiRequest(`/api/papers/${state.selectedPaperId}`, { auth: true });
   renderPaperDetail(detailData.paper || {});
+}
+
+async function refreshDashboard() {
+  try {
+    const data = await apiRequest('/api/state');
+    const totals = data.totals || {};
+    const statAgents = document.querySelector('#stat-agents');
+    const statRooms = document.querySelector('#stat-rooms');
+    const statMessages = document.querySelector('#stat-messages');
+    const statPapers = document.querySelector('#stat-papers');
+    const statRunners = document.querySelector('#stat-runners');
+    if (statAgents) statAgents.textContent = totals.agents || 0;
+    if (statRooms) statRooms.textContent = totals.rooms || 0;
+    if (statMessages) statMessages.textContent = totals.messages || 0;
+    if (statPapers) statPapers.textContent = totals.papers || 0;
+
+    const runners = Array.isArray(data.runners) ? data.runners : [];
+    const onlineRunners = runners.filter((r) => r.online);
+    if (statRunners) statRunners.textContent = onlineRunners.length;
+
+    const agentDirCount = document.querySelector('#agent-dir-count');
+    const agentDirBody = document.querySelector('#agent-directory-body');
+    const allAgents = Array.isArray(data.active_agents) ? data.active_agents : [];
+    // Sort by total activity (messages + summaries + critiques) descending
+    const sortedAgents = [...allAgents].sort(
+      (a, b) => (b.messages + b.summaries + b.critiques) - (a.messages + a.summaries + a.critiques)
+    );
+    const displayAgents = state.agentDirShowAll ? sortedAgents : sortedAgents.slice(0, 15);
+    if (agentDirCount) agentDirCount.textContent = `${displayAgents.length}${!state.agentDirShowAll && allAgents.length > 15 ? ` / ${allAgents.length}` : ''}`;
+
+    // Update filter button states
+    const top15Btn = document.querySelector('#agent-dir-top15-btn');
+    const allBtn = document.querySelector('#agent-dir-all-btn');
+    if (top15Btn) top15Btn.classList.toggle('active-filter', !state.agentDirShowAll);
+    if (allBtn) allBtn.classList.toggle('active-filter', state.agentDirShowAll);
+
+    if (agentDirBody) {
+      if (!allAgents.length) {
+        agentDirBody.innerHTML = '<tr><td colspan="5" class="small" style="text-align:center;padding:1rem;">No agents yet. Register one to get started.</td></tr>';
+      } else {
+        const runnerAgentIds = new Set(onlineRunners.map((r) => r.agent_id));
+        agentDirBody.innerHTML = displayAgents
+          .map((agent) => {
+            const isOnline = runnerAgentIds.has(agent.agent_id);
+            const dotClass = isOnline ? 'status-online' : 'status-offline';
+            const statusLabel = isOnline ? 'Online' : 'Offline';
+            return `<tr>
+              <td><strong>${escapeHtml(agent.agent_name || 'agent')}</strong></td>
+              <td><span class="status-dot ${dotClass}"></span>${statusLabel}</td>
+              <td>${agent.messages || 0}</td>
+              <td>${agent.summaries || 0}</td>
+              <td>${agent.critiques || 0}</td>
+            </tr>`;
+          })
+          .join('');
+      }
+    }
+
+    const feedCount = document.querySelector('#activity-feed-count');
+    const feedContainer = document.querySelector('#activity-feed');
+    const recent = Array.isArray(data.recent_activity) ? data.recent_activity : [];
+    if (feedCount) feedCount.textContent = recent.length;
+
+    if (feedContainer) {
+      if (!recent.length) {
+        feedContainer.innerHTML = '<div class="small" style="text-align:center;padding:1rem;">No activity yet. Create a room and post a message.</div>';
+      } else {
+        const roomMap = new Map();
+        if (Array.isArray(data.rooms)) {
+          for (const room of data.rooms) {
+            roomMap.set(room.id, room.topic || room.id);
+          }
+        }
+        feedContainer.innerHTML = recent
+          .slice(0, 30)
+          .map((msg) => {
+            const role = String(msg.role || 'note').toLowerCase();
+            const roleClass = `badge-${role.replace(/[^a-z0-9]+/g, '-')}`;
+            const roomName = roomMap.get(msg.room_id) || 'Unknown room';
+            const content = String(msg.content || '').slice(0, 150);
+            const time = formatDate(msg.created_at);
+            return `<div class="feed-item">
+              <div class="feed-head">
+                <span class="feed-agent">${escapeHtml(msg.agent_name || 'agent')}</span>
+                <span class="badge ${escapeHtml(roleClass)}">${escapeHtml(role)}</span>
+                <span class="feed-room">${escapeHtml(roomName)}</span>
+                <span class="feed-time">${escapeHtml(time)}</span>
+              </div>
+              <div class="feed-content">${escapeHtml(content)}${content.length >= 150 ? '...' : ''}</div>
+            </div>`;
+          })
+          .join('');
+      }
+    }
+  } catch (error) {
+    console.warn('Dashboard refresh failed:', error.error || error);
+  }
 }
 
 function switchView(view) {
@@ -854,6 +1337,8 @@ function switchView(view) {
   for (const button of el.navButtons) {
     button.classList.toggle('active', button.dataset.view === view);
   }
+  // Re-evaluate banner visibility (setup-panel is agent-view-only).
+  updateProtectedUi();
 }
 
 function startRoomPolling() {
@@ -921,9 +1406,6 @@ function setupRoomsSidebarInteractions() {
 }
 
 async function bootstrap() {
-  if (el.baseUrl) {
-    el.baseUrl.textContent = BASE_URL;
-  }
   el.postMessageBtn = el.messageForm ? el.messageForm.querySelector('button[type="submit"]') : null;
   ensureReplyTargetControls();
   loadRoomsSidebarState();
@@ -942,22 +1424,42 @@ async function bootstrap() {
 
   renderIdentitySelect();
   el.activeKeyInput.value = state.activeKey;
+  state.paperSearch = String((el.papersSearchInput && el.papersSearchInput.value) || '').trim();
+  state.paperDiscussedFilter = String((el.papersFilterSelect && el.papersFilterSelect.value) || 'all').trim() || 'all';
   updateProtectedUi();
   updatePostButtonState();
 
   try {
+    const health = await apiRequest('/api/healthz');
+    state.demoMode = Boolean(health.demo_mode);
+    state.mockOpenAI = Boolean(health.mock_openai);
+  } catch (_) {
+    state.demoMode = false;
+    state.mockOpenAI = false;
+  }
+  renderSetupPanel({ reason: !state.activeKey ? 'missing_key' : '' });
+
+  try {
+    await refreshDashboard();
+  } catch (_) {
+    // Dashboard load is best-effort
+  }
+
+  try {
     await refreshRoomsAndMessages();
+    await refreshAvailableAgents();
   } catch (error) {
-    setError(error.error || 'Failed to load rooms.', error);
+    console.warn('Initial load:', error.error || error);
   }
 
   if (state.activeKey) {
     try {
       await refreshAgentStatus();
       await refreshPapers();
+      await refreshAvailableAgents();
       clearError();
     } catch (error) {
-      setError(error.error || 'Failed to load authenticated data.', error);
+      console.warn('Auth data load:', error.error || error);
     }
   }
 
@@ -979,6 +1481,7 @@ el.setKeyBtn.addEventListener('click', async () => {
     await refreshAgentStatus();
     await refreshPapers();
     await refreshRoomsAndMessages();
+    await refreshAvailableAgents();
     clearError();
   } catch (error) {
     setError(error.error || 'Active key update failed.', error);
@@ -1008,6 +1511,7 @@ el.identitySelect.addEventListener('change', async (event) => {
     await refreshAgentStatus();
     await refreshPapers();
     await refreshRoomsAndMessages();
+    await refreshAvailableAgents();
   } catch (error) {
     setError(error.error || 'Failed to switch identity.', error);
   }
@@ -1024,6 +1528,22 @@ el.removeKeyBtn.addEventListener('click', () => {
   el.agentStatus.textContent = nextKey ? el.agentStatus.textContent : 'No active key.';
 });
 
+// Agent directory filter buttons
+const agentDirTop15Btn = document.querySelector('#agent-dir-top15-btn');
+const agentDirAllBtn = document.querySelector('#agent-dir-all-btn');
+if (agentDirTop15Btn) {
+  agentDirTop15Btn.addEventListener('click', async () => {
+    state.agentDirShowAll = false;
+    await refreshDashboard();
+  });
+}
+if (agentDirAllBtn) {
+  agentDirAllBtn.addEventListener('click', async () => {
+    state.agentDirShowAll = true;
+    await refreshDashboard();
+  });
+}
+
 el.navButtons.forEach((button) => {
   button.addEventListener('click', async () => {
     const view = button.dataset.view;
@@ -1032,12 +1552,16 @@ el.navButtons.forEach((button) => {
     clearError();
 
     try {
-      if (view === 'rooms') {
+      if (view === 'dashboard') {
+        await refreshDashboard();
+      } else if (view === 'rooms') {
         await refreshRoomsAndMessages();
+        await refreshAvailableAgents();
       } else if (view === 'papers' && state.activeKey) {
         await refreshPapers();
       } else if (view === 'agent' && state.activeKey) {
         await refreshAgentStatus();
+        await refreshAvailableAgents();
       }
     } catch (error) {
       setError(error.error || 'View load failed.', error);
@@ -1065,6 +1589,7 @@ el.registerForm.addEventListener('submit', async (event) => {
     await refreshAgentStatus();
     await refreshRoomsAndMessages();
     await refreshPapers();
+    await refreshAvailableAgents();
     el.registerForm.reset();
   } catch (error) {
     setError(error.error || 'Registration failed.', error);
@@ -1125,20 +1650,75 @@ el.roomsPollToggle.addEventListener('change', () => {
   startRoomPolling();
 });
 
+if (el.attachRunnersBtn) {
+  el.attachRunnersBtn.addEventListener('click', async () => {
+    clearError();
+    if (!state.selectedRoomId) {
+      setError('Select a room first.', { status: 400 });
+      return;
+    }
+    try {
+      const mode = String((el.attachRunnersMode && el.attachRunnersMode.value) || 'all').trim();
+      const room = getRoomById(state.selectedRoomId);
+      const payload =
+        mode === 'selected' && room && Array.isArray(room.agent_ids) && room.agent_ids.length
+          ? { agent_ids: room.agent_ids }
+          : {};
+      const result = await apiRequest(`/api/rooms/${state.selectedRoomId}/attach_runners`, {
+        method: 'POST',
+        auth: true,
+        body: payload,
+      });
+      await refreshRunners();
+      if (Number(result.attached_count || 0) === 0) {
+        setRunnerSuggestionMessage(result.reason || 'No runners online. Start runners and try again.');
+        showRunnerSuggestion(true);
+      } else {
+        showRunnerSuggestion(false);
+      }
+    } catch (error) {
+      setError(error.error || 'Failed to attach runners.', error);
+    }
+  });
+}
+
+if (el.createRoomAgentOptions) {
+  el.createRoomAgentOptions.addEventListener('change', () => {
+    state.draftRoomAgentIds = selectedRoomAgentIds();
+  });
+}
+
+if (el.agentsShowAllToggle) {
+  el.agentsShowAllToggle.addEventListener('change', () => {
+    renderCreateRoomAgentOptions();
+  });
+}
+
+if (el.agentsShowLegacyToggle) {
+  el.agentsShowLegacyToggle.addEventListener('change', () => {
+    renderCreateRoomAgentOptions();
+  });
+}
+
 el.createRoomForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   clearError();
 
   try {
     const payload = formToObject(el.createRoomForm);
+    const selectedAgentIds = [...el.createRoomForm.querySelectorAll('input[name="agent_ids"]:checked')]
+      .map((node) => String(node.value || '').trim())
+      .filter(Boolean);
     const data = await apiRequest('/api/rooms', {
       method: 'POST',
       auth: true,
-      body: { topic: payload.topic },
+      body: { topic: payload.topic, agent_ids: selectedAgentIds },
     });
 
     state.selectedRoomId = data.room_id;
     el.createRoomForm.reset();
+    state.draftRoomAgentIds = [];
+    renderCreateRoomAgentOptions();
     await refreshRoomsAndMessages();
   } catch (error) {
     setError(error.error || 'Create room failed.', error);
@@ -1149,6 +1729,7 @@ el.roomsList.addEventListener('click', async (event) => {
   const button = event.target.closest('[data-room-id]');
   if (!button) return;
   state.selectedRoomId = button.dataset.roomId;
+  showRunnerSuggestion(false);
   autoCollapseRoomsSidebar();
   clearError();
 
@@ -1180,6 +1761,23 @@ el.messagesThread.addEventListener('click', async (event) => {
     }
   }
 });
+
+if (el.applySuggestedPromptBtn) {
+  el.applySuggestedPromptBtn.addEventListener('click', () => {
+    const kind = String(el.suggestedPromptSelect.value || '').trim();
+    if (!kind) return;
+    const room = getRoomById(state.selectedRoomId);
+    const text = suggestedPromptText(kind, room);
+    if (!text) return;
+    const roleField = el.messageForm.querySelector('[name="role"]');
+    const contentField = el.messageForm.querySelector('[name="content"]');
+    if (roleField && kind === 'recommend') roleField.value = 'questions';
+    if (contentField) {
+      contentField.value = text;
+      contentField.focus();
+    }
+  });
+}
 
 el.replyToInput.addEventListener('input', () => {
   state.replyToPinned = true;
@@ -1244,6 +1842,7 @@ el.messageForm.addEventListener('submit', async (event) => {
     updateReplyPinnedIndicator();
 
     await refreshRoomsAndMessages();
+    scheduleRunnerReplyHint(state.selectedRoomId);
   } catch (error) {
     if (
       Number(error.status) === 409 &&
@@ -1270,7 +1869,10 @@ el.ingestForm.addEventListener('submit', async (event) => {
     const result = await apiRequest('/api/papers/ingest', {
       method: 'POST',
       auth: true,
-      body: { url: payload.url },
+      body: {
+        url: payload.url,
+        room_id: state.selectedRoomId || undefined,
+      },
     });
 
     state.selectedPaperId = result.paper_id || state.selectedPaperId;
@@ -1290,6 +1892,20 @@ el.refreshPapersBtn.addEventListener('click', async () => {
   }
 });
 
+if (el.papersSearchForm) {
+  el.papersSearchForm.addEventListener('input', async () => {
+    state.paperSearch = String(el.papersSearchInput.value || '').trim();
+    state.paperDiscussedFilter = String(el.papersFilterSelect.value || 'all').trim() || 'all';
+    if (!state.activeKey) return;
+    try {
+      await refreshPapers();
+      clearError();
+    } catch (error) {
+      setError(error.error || 'Paper filter failed.', error);
+    }
+  });
+}
+
 el.papersList.addEventListener('click', async (event) => {
   const button = event.target.closest('[data-paper-id]');
   if (!button) return;
@@ -1306,6 +1922,20 @@ el.papersList.addEventListener('click', async (event) => {
 });
 
 el.paperDetail.addEventListener('click', async (event) => {
+  const roomButton = event.target.closest('.paper-room-link');
+  if (roomButton) {
+    const roomId = String(roomButton.dataset.roomId || '').trim();
+    if (!roomId) return;
+    state.selectedRoomId = roomId;
+    switchView('rooms');
+    try {
+      await refreshRoomsAndMessages();
+    } catch (error) {
+      setError(error.error || 'Failed to open room from paper detail.', error);
+    }
+    return;
+  }
+
   const button = event.target.closest('.copy-snippet-btn');
   if (button) {
     await copyText(button.dataset.snippet || '');
@@ -1348,5 +1978,269 @@ if (el.errorClose) {
     clearError();
   });
 }
+
+// ─── Paper Feed ───────────────────────────────────────────────────────────────
+
+function feedFmt(isoStr) {
+  if (!isoStr) return '';
+  const d = new Date(isoStr);
+  return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+function renderFeedCards() {
+  if (!el.feedCards) return;
+  const { items, lastRefreshed } = state.feed;
+  if (el.feedLastRefreshed) {
+    el.feedLastRefreshed.textContent = lastRefreshed
+      ? `Last refreshed: ${feedFmt(lastRefreshed)}`
+      : '';
+  }
+  if (!items.length) {
+    el.feedCards.innerHTML = '<div class="feed-empty">No papers yet. Click Refresh Feed.</div>';
+    return;
+  }
+  el.feedCards.innerHTML = items
+    .map((item, idx) => {
+      const tags = (item.tags || []).slice(0, 4)
+        .map((t) => `<span class="feed-card-tag">${escapeHtml(t)}</span>`)
+        .join('');
+      return `
+        <div class="feed-card" data-feed-idx="${idx}" role="button" tabindex="0">
+          <div class="feed-card-title">${escapeHtml(item.title)}</div>
+          <div class="feed-card-tldr">${escapeHtml(item.tldr_1 || '')}</div>
+          <div class="feed-card-meta">
+            ${tags}
+            <span class="feed-card-date">${escapeHtml(item.venue || 'arXiv')} · ${item.year || feedFmt(item.fetched_at)}</span>
+          </div>
+        </div>`;
+    })
+    .join('');
+
+  // Card click → open drawer
+  el.feedCards.querySelectorAll('.feed-card').forEach((card) => {
+    card.addEventListener('click', () => {
+      const idx = parseInt(card.dataset.feedIdx, 10);
+      openFeedDrawer(state.feed.items[idx]);
+    });
+    card.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') card.click();
+    });
+  });
+}
+
+function openFeedDrawer(item) {
+  if (!item || !el.feedDrawerBackdrop) return;
+  state.feed.activeItem = item;
+
+  el.feedDrawerTitle.textContent = item.title || 'Paper';
+  el.feedDrawerMeta.textContent =
+    [item.authors?.slice(0, 3).join(', '), item.year, item.venue]
+      .filter(Boolean).join(' · ');
+
+  el.feedDrawerLinks.innerHTML = `
+    <a href="${escapeHtml(item.url_abs)}" target="_blank" rel="noopener" class="feed-link-abs">arXiv Page ↗</a>
+    <a href="${escapeHtml(item.url_pdf)}" target="_blank" rel="noopener" class="feed-link-pdf">PDF ↗</a>`;
+
+  el.feedDrawerTldr.textContent = item.tldr_1 || '';
+  el.feedDrawerWhy.innerHTML = (item.why_recommended || [])
+    .map((b) => `<li>${escapeHtml(b)}</li>`).join('');
+  el.feedDrawerAbstract.textContent = item.abstract || 'No abstract available.';
+
+  // Populate rooms
+  if (el.feedRoomSelect) {
+    const rooms = state.rooms || [];
+    el.feedRoomSelect.innerHTML =
+      '<option value="">Select room…</option>' +
+      rooms.map((r) =>
+        `<option value="${escapeHtml(r.id)}">${escapeHtml((r.topic || r.id).slice(0, 60))}</option>`
+      ).join('');
+    if (state.selectedRoomId) el.feedRoomSelect.value = state.selectedRoomId;
+  }
+
+  el.feedDrawerBackdrop.classList.remove('hidden');
+}
+
+function closeFeedDrawer() {
+  if (el.feedDrawerBackdrop) el.feedDrawerBackdrop.classList.add('hidden');
+  state.feed.activeItem = null;
+}
+
+// Build a structured room message for the given role + paper
+// (Implements the full 8-section template from the team spec + role-specific instructions)
+function buildFeedRoomMessage(paper, role) {
+  const title = paper.title || 'Untitled';
+  const abs   = paper.abstract || '(no abstract)';
+  const url   = paper.url_abs  || '';
+  const pdf   = paper.url_pdf  || '';
+  const auth  = (paper.authors || []).slice(0, 4).join(', ') || 'Unknown';
+  const yr    = paper.year || '';
+
+  // Shared preamble — always included
+  const preamble =
+    `**Paper to discuss**\n` +
+    `Title: ${title}\n` +
+    `Links: ${url} | ${pdf}\n` +
+    `Authors/Year: ${auth} (${yr})\n` +
+    `Abstract: ${abs}\n\n`;
+
+  const template8 =
+    `Follow this format (tight, technical, no fluff):\n` +
+    `1) TL;DR (2 sentences)\n` +
+    `2) Key contribution (1–3 bullet claims)\n` +
+    `3) What's new vs prior work (name closest baseline if obvious)\n` +
+    `4) Methods snapshot (core idea + assumptions)\n` +
+    `5) Evidence: what experiments/results support the main claims?\n` +
+    `6) Limitations / failure modes (min 3, be concrete)\n` +
+    `7) Replication notes: data, compute, code availability\n` +
+    `8) Next steps: 2 experiments we should run OR 2 ways to extend\n` +
+    `If you reference a claim, quote the relevant part of the abstract or section name.`;
+
+  const roleInstructions = {
+    scout:
+      `You are Scout. Goal: place this paper in context.\n` +
+      `Return:\n` +
+      `- Closest 3 related papers (title + link)\n` +
+      `- One sentence each: how this paper differs\n` +
+      `- 3 keywords that define the technique\n` +
+      `Be honest if uncertain; do not hallucinate citations.`,
+    summarizer:
+      `You are Summarizer. Only use the provided abstract and any quoted snippets in-room.\n` +
+      template8,
+    critic:
+      `You are Critic. Your job is to stress-test this paper constructively.\n` +
+      `Return:\n` +
+      `- 5 strongest objections (each: what could be wrong + why it matters)\n` +
+      `- 3 missing ablations that would change your belief\n` +
+      `- 2 "gotchas" that often hide in eval (leakage, cherry-picking, tuning budgets, etc.)\n` +
+      `No vague critique — tie every point to a specific claim in the TL;DR or contribution.`,
+    builder:
+      `You are Builder. Convert discussion into a research plan.\n` +
+      `Return:\n` +
+      `- A minimal reproduction checklist (10 items max)\n` +
+      `- A 2-week experiment plan (Day 1–14) with deliverables\n` +
+      `- A "drop-in idea": one modification implementable in <200 LOC\n` +
+      `Keep it realistic.`,
+    synthesizer:
+      `You are Synthesizer. Combine Scout + Summarizer + Critic + Builder outputs.\n` +
+      `Return:\n` +
+      `- 5-bullet executive takeaway\n` +
+      `- Decision: {READ / SKIM / IGNORE} with justification\n` +
+      `- If READ: which sections to read first and why`,
+  };
+
+  const instruction = roleInstructions[role] || roleInstructions.summarizer;
+  return preamble + instruction;
+}
+
+// Refresh feed from API
+async function refreshFeed() {
+  const topic = (el.feedTopicInput?.value || '').trim();
+  if (!topic) { setError('Please enter a topic first.', {}); return; }
+  if (!state.activeKey) { setError('Set your API key first.', {}); return; }
+  state.feed.topic = topic;
+
+  if (el.feedRefreshBtn) el.feedRefreshBtn.disabled = true;
+  try {
+    const res = await apiRequest(`/api/feeds/${encodeURIComponent(topic)}/refresh`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+      auth: true,
+    });
+    state.feed.items = res.items || [];
+    state.feed.lastRefreshed = res.items?.[0]?.fetched_at || new Date().toISOString();
+    renderFeedCards();
+    clearError();
+  } catch (err) {
+    setError(err.error || 'Feed refresh failed.', err);
+  } finally {
+    if (el.feedRefreshBtn) el.feedRefreshBtn.disabled = false;
+  }
+}
+
+// Load existing cached feed (GET)
+async function loadFeedCached(topic) {
+  if (!state.activeKey) return;
+  try {
+    const res = await apiRequest(`/api/feeds/${encodeURIComponent(topic)}`, { auth: true });
+    state.feed.items = res.items || [];
+    state.feed.lastRefreshed = res.last_refreshed || null;
+    renderFeedCards();
+  } catch { /* ignore */ }
+}
+
+// ── Feed event handlers ──
+if (el.feedRefreshBtn) {
+  el.feedRefreshBtn.addEventListener('click', refreshFeed);
+}
+
+if (el.feedDrawerClose) {
+  el.feedDrawerClose.addEventListener('click', closeFeedDrawer);
+}
+
+if (el.feedDrawerBackdrop) {
+  el.feedDrawerBackdrop.addEventListener('click', (e) => {
+    if (e.target === el.feedDrawerBackdrop) closeFeedDrawer();
+  });
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !el.feedDrawerBackdrop?.classList.contains('hidden')) {
+    closeFeedDrawer();
+  }
+});
+
+if (el.feedSendBtn) {
+  el.feedSendBtn.addEventListener('click', async () => {
+    const paper = state.feed.activeItem;
+    if (!paper) return;
+    const roomId = el.feedRoomSelect?.value;
+    if (!roomId) { alert('Please select a room.'); return; }
+    const role = el.feedRoleSelect?.value || 'summarizer';
+
+    const content = buildFeedRoomMessage(paper, role);
+    const roleToMsgRole = {
+      scout: 'related-work',
+      summarizer: 'summary',
+      critic: 'critique',
+      builder: 'experiments',
+      synthesizer: 'summary',
+    };
+    const msgRole = roleToMsgRole[role] || 'summary';
+
+    el.feedSendBtn.disabled = true;
+    try {
+      await apiRequest(`/api/rooms/${encodeURIComponent(roomId)}/messages`, {
+        method: 'POST',
+        body: JSON.stringify({
+          content,
+          role: msgRole,
+          citation: paper.id || '',
+        }),
+        auth: true,
+      });
+      closeFeedDrawer();
+      // Switch to room view so user sees the post
+      state.selectedRoomId = roomId;
+      switchView('rooms');
+      await refreshRoomsAndMessages();
+      clearError();
+    } catch (err) {
+      setError(err.error || 'Failed to send to room.', err);
+    } finally {
+      el.feedSendBtn.disabled = false;
+    }
+  });
+}
+
+// Load cached feed whenever user navigates to Feed view.
+// We patch the existing navButton listeners rather than redeclare switchView.
+el.navButtons.forEach((btn) => {
+  if (btn.dataset.view === 'feed') {
+    btn.addEventListener('click', () => {
+      const topic = el.feedTopicInput?.value?.trim() || state.feed.topic;
+      loadFeedCached(topic);
+    });
+  }
+});
 
 bootstrap();

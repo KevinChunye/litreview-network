@@ -18,9 +18,22 @@ const DATA_FILE = STORE_PATH_ENV
 const STATIC_DIR = path.join(__dirname, 'public');
 const FETCH_TIMEOUT_MS = Number(process.env.PAPER_FETCH_TIMEOUT_MS || 10000);
 const MAX_INGEST_BYTES = Number(process.env.PAPER_MAX_BYTES || 10 * 1024 * 1024);
+const RUNNER_DEFAULT_POLL_SECONDS = Math.max(1, Number(process.env.RUNNER_POLL_SECONDS || 2));
+const RUNNER_ONLINE_TTL_SECONDS = Math.max(5, Number(process.env.RUNNER_ONLINE_TTL_SECONDS || 60));
 const MAX_SNIPPETS = 5;
 const SNIPPET_SIZE = 400;
+const DEFAULT_RECOMMEND_K = 10;
+const MAX_RECOMMEND_K = 20;
+const ARXIV_API_URL = 'https://export.arxiv.org/api/query';
 const UNSAFE_CONTROL_REGEX = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
+const TRACKING_QUERY_PREFIXES = ['utm_', 'fbclid', 'gclid', 'mc_', 'ref', 'source', 'si'];
+const RAG_BASE = (process.env.RAG_BASE || 'http://127.0.0.1:8001').replace(/\/$/, '');
+
+// ── Paper Feed ────────────────────────────────────────────────────────────────
+const { fetchArxivFeed } = require('./scripts/lib/feed_fetcher');
+const FEED_MAX_PER_TOPIC = 5;
+const FEED_RATE_LIMIT_MS = Number(process.env.FEED_RATE_LIMIT_MS || 5000);
+let _feedLastFetch = {}; // topic → timestamp (in-process rate-limit)
 
 const VALID_MESSAGE_ROLES = new Set([
   'summary',
@@ -73,6 +86,354 @@ function validName(name) {
   return /^[a-z0-9][a-z0-9_-]{1,39}$/.test(name);
 }
 
+function extractArxivIdFromUrl(inputUrl) {
+  if (!inputUrl) return '';
+  try {
+    const parsed = new URL(inputUrl);
+    if (!parsed.hostname.toLowerCase().includes('arxiv.org')) return '';
+    const parts = parsed.pathname.split('/').filter(Boolean);
+    if (parts.length < 2) return '';
+    let value = parts[1] || '';
+    if (parts[0] === 'pdf' && value.endsWith('.pdf')) {
+      value = value.slice(0, -4);
+    }
+    value = value.replace(/v\d+$/i, '');
+    value = value.trim();
+    return value ? value.toLowerCase() : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+function normalizeCanonicalUrl(inputUrl) {
+  if (!inputUrl) return '';
+  try {
+    const parsed = new URL(inputUrl);
+    parsed.hash = '';
+    const kept = [];
+    for (const [key, value] of parsed.searchParams.entries()) {
+      const lowered = key.toLowerCase();
+      if (TRACKING_QUERY_PREFIXES.some((prefix) => lowered === prefix || lowered.startsWith(prefix))) {
+        continue;
+      }
+      kept.push([key, value]);
+    }
+    kept.sort(([a], [b]) => a.localeCompare(b));
+    parsed.search = '';
+    for (const [key, value] of kept) {
+      parsed.searchParams.append(key, value);
+    }
+    let normalized = parsed.toString();
+    normalized = normalized.replace(/\/+$/, '');
+    return normalized;
+  } catch (_) {
+    return normalizeText(inputUrl, 2000);
+  }
+}
+
+function buildCanonicalPaperIdentity(inputUrl) {
+  const canonicalUrl = normalizeCanonicalUrl(inputUrl);
+  const arxivId = extractArxivIdFromUrl(canonicalUrl);
+  if (arxivId) {
+    return {
+      canonical_id: `arxiv:${arxivId}`,
+      canonical_url: canonicalUrl,
+      source: 'arxiv',
+    };
+  }
+  const urlHash = createHash('sha256').update(canonicalUrl).digest('hex').slice(0, 24);
+  return {
+    canonical_id: `url:${urlHash}`,
+    canonical_url: canonicalUrl,
+    source: 'publisher',
+  };
+}
+
+function parseCitationPaperIds(citation) {
+  const text = normalizeText(citation || '', 400);
+  if (!text) return [];
+  const matches = [...text.matchAll(/paper:([a-z0-9:_.-]+)/gi)];
+  const ids = [];
+  for (const match of matches) {
+    const candidate = normalizeText(match[1] || '', 120);
+    if (candidate && !ids.includes(candidate)) ids.push(candidate);
+  }
+  return ids;
+}
+
+function ensureRoomPaperLink(store, roomId, paperId) {
+  if (!roomId || !paperId) return;
+  if (!Array.isArray(store.room_papers)) store.room_papers = [];
+  const exists = store.room_papers.some((link) => link.roomId === roomId && link.paperId === paperId);
+  if (exists) return;
+  store.room_papers.push({
+    id: randomUUID(),
+    roomId,
+    paperId,
+    createdAt: now(),
+  });
+}
+
+function paperFromIdentifier(store, identifier) {
+  const token = normalizeText(identifier || '', 120);
+  if (!token) return null;
+  return (
+    store.papers.find((paper) => paper.paper_id === token) ||
+    store.papers.find((paper) => paper.canonical_id === token) ||
+    store.papers.find(
+      (paper) => Array.isArray(paper.alias_paper_ids) && paper.alias_paper_ids.includes(token),
+    ) ||
+    null
+  );
+}
+
+function sanitizeAuthors(input) {
+  if (!Array.isArray(input)) return [];
+  const cleaned = [];
+  for (const value of input) {
+    const name = normalizeText(value || '', 140);
+    if (name && !cleaned.includes(name)) cleaned.push(name);
+    if (cleaned.length >= 30) break;
+  }
+  return cleaned;
+}
+
+function sanitizeYear(input) {
+  const year = Number(input);
+  if (!Number.isInteger(year)) return null;
+  if (year < 1900 || year > 2100) return null;
+  return year;
+}
+
+function normalizePaperRecord(inputPaper) {
+  const url = normalizeText(inputPaper.url || inputPaper.canonical_url || '', 2000);
+  const identity = buildCanonicalPaperIdentity(url);
+  const createdAt = normalizeText(inputPaper.created_at || inputPaper.first_ingested_at || '', 40) || now();
+  const firstIngestedAt = normalizeText(inputPaper.first_ingested_at || inputPaper.created_at || '', 40) || createdAt;
+  const lastSeenAt = normalizeText(inputPaper.last_seen_at || inputPaper.created_at || '', 40) || createdAt;
+  const aliases = Array.isArray(inputPaper.alias_paper_ids)
+    ? inputPaper.alias_paper_ids.map((value) => normalizeText(value || '', 64)).filter(Boolean)
+    : [];
+  const ownId = normalizeText(inputPaper.paper_id || '', 64) || randomUUID();
+  if (!aliases.includes(ownId)) aliases.unshift(ownId);
+  const snippets = Array.isArray(inputPaper.snippets)
+    ? inputPaper.snippets.map((snippet) => normalizeText(snippet || '', SNIPPET_SIZE + 80)).filter(Boolean)
+    : [];
+
+  return {
+    paper_id: ownId,
+    alias_paper_ids: [...new Set(aliases)],
+    canonical_id: normalizeText(inputPaper.canonical_id || identity.canonical_id, 160) || identity.canonical_id,
+    canonical_url: normalizeText(inputPaper.canonical_url || identity.canonical_url, 2000) || identity.canonical_url,
+    source: normalizeText(inputPaper.source || identity.source, 60) || identity.source,
+    url: url || identity.canonical_url,
+    title: normalizeText(inputPaper.title || '', 240) || 'Untitled paper',
+    abstract: normalizeText(inputPaper.abstract || '', 900) || 'Abstract unavailable.',
+    text_preview: normalizeText(inputPaper.text_preview || '', 2600),
+    snippets: snippets.length ? snippets : buildSnippets(inputPaper.text_preview || inputPaper.abstract || ''),
+    authors: sanitizeAuthors(inputPaper.authors || []),
+    year: sanitizeYear(inputPaper.year),
+    venue: normalizeText(inputPaper.venue || '', 120) || null,
+    created_at: createdAt,
+    first_ingested_at: firstIngestedAt,
+    last_seen_at: lastSeenAt,
+    ingested_by_agent_id: normalizeText(inputPaper.ingested_by_agent_id || '', 64) || null,
+  };
+}
+
+function mergePaperRecords(existing, incoming) {
+  const merged = { ...existing };
+  merged.alias_paper_ids = [
+    ...new Set([...(existing.alias_paper_ids || []), ...(incoming.alias_paper_ids || [])]),
+  ];
+  merged.first_ingested_at =
+    new Date(incoming.first_ingested_at).getTime() < new Date(existing.first_ingested_at).getTime()
+      ? incoming.first_ingested_at
+      : existing.first_ingested_at;
+  merged.last_seen_at =
+    new Date(incoming.last_seen_at).getTime() > new Date(existing.last_seen_at).getTime()
+      ? incoming.last_seen_at
+      : existing.last_seen_at;
+  merged.created_at =
+    new Date(incoming.created_at).getTime() < new Date(existing.created_at).getTime()
+      ? incoming.created_at
+      : existing.created_at;
+  if (!merged.title || merged.title === 'Untitled paper') merged.title = incoming.title;
+  if (!merged.abstract || merged.abstract === 'Abstract unavailable.') merged.abstract = incoming.abstract;
+  if (!merged.text_preview && incoming.text_preview) merged.text_preview = incoming.text_preview;
+  if ((!Array.isArray(merged.snippets) || !merged.snippets.length) && incoming.snippets?.length) {
+    merged.snippets = incoming.snippets;
+  }
+  if ((!Array.isArray(merged.authors) || !merged.authors.length) && incoming.authors?.length) {
+    merged.authors = incoming.authors;
+  }
+  if (!merged.year && incoming.year) merged.year = incoming.year;
+  if (!merged.venue && incoming.venue) merged.venue = incoming.venue;
+  if (!merged.ingested_by_agent_id && incoming.ingested_by_agent_id) {
+    merged.ingested_by_agent_id = incoming.ingested_by_agent_id;
+  }
+  if (!merged.url && incoming.url) merged.url = incoming.url;
+  if (!merged.canonical_url && incoming.canonical_url) merged.canonical_url = incoming.canonical_url;
+  return merged;
+}
+
+function dedupePapersAndLinks(store) {
+  if (!Array.isArray(store.papers)) store.papers = [];
+  if (!Array.isArray(store.room_papers)) store.room_papers = [];
+
+  const byCanonical = new Map();
+  const aliasToPrimary = new Map();
+  for (const paper of store.papers) {
+    const normalized = normalizePaperRecord(paper);
+    const key = normalized.canonical_id || `paper:${normalized.paper_id}`;
+    if (!byCanonical.has(key)) {
+      byCanonical.set(key, normalized);
+    } else {
+      const merged = mergePaperRecords(byCanonical.get(key), normalized);
+      byCanonical.set(key, merged);
+    }
+  }
+
+  const nextPapers = [...byCanonical.values()];
+  for (const paper of nextPapers) {
+    paper.alias_paper_ids = [...new Set([paper.paper_id, ...(paper.alias_paper_ids || [])])];
+    for (const alias of paper.alias_paper_ids) {
+      aliasToPrimary.set(alias, paper.paper_id);
+    }
+    aliasToPrimary.set(paper.canonical_id, paper.paper_id);
+  }
+
+  const nextLinks = [];
+  const linkSeen = new Set();
+  for (const link of store.room_papers) {
+    const roomId = normalizeText(link.roomId || link.room_id || '', 64);
+    const paperToken = normalizeText(link.paperId || link.paper_id || '', 160);
+    const resolvedPaperId = aliasToPrimary.get(paperToken) || paperToken;
+    if (!roomId || !resolvedPaperId) continue;
+    if (!nextPapers.some((paper) => paper.paper_id === resolvedPaperId)) continue;
+    const key = `${roomId}::${resolvedPaperId}`;
+    if (linkSeen.has(key)) continue;
+    linkSeen.add(key);
+    nextLinks.push({
+      id: normalizeText(link.id || '', 64) || randomUUID(),
+      roomId,
+      paperId: resolvedPaperId,
+      createdAt: normalizeText(link.createdAt || link.created_at || '', 40) || now(),
+    });
+  }
+
+  store.papers = nextPapers;
+  store.room_papers = nextLinks;
+}
+
+function listRoomPaperLinks(store, roomId) {
+  if (!Array.isArray(store.room_papers)) return [];
+  return store.room_papers.filter((link) => link.roomId === roomId);
+}
+
+function listPaperRooms(store, paperId) {
+  const links = (store.room_papers || []).filter((link) => link.paperId === paperId);
+  const ids = [...new Set(links.map((link) => link.roomId))];
+  return ids
+    .map((roomId) => store.rooms.find((room) => room.id === roomId))
+    .filter(Boolean)
+    .map((room) => summarizeRoom(store, room));
+}
+
+function paperRelatedIds(store, paperId) {
+  const roomIds = (store.room_papers || [])
+    .filter((link) => link.paperId === paperId)
+    .map((link) => link.roomId);
+  const counts = new Map();
+  for (const roomId of roomIds) {
+    const links = (store.room_papers || []).filter((link) => link.roomId === roomId);
+    for (const link of links) {
+      if (link.paperId === paperId) continue;
+      counts.set(link.paperId, (counts.get(link.paperId) || 0) + 1);
+    }
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([id]) => id);
+}
+
+function maybeLinkRoomPapersFromCitation(store, roomId, citationText) {
+  const tokens = parseCitationPaperIds(citationText || '');
+  for (const token of tokens) {
+    const paper = paperFromIdentifier(store, token);
+    if (paper) {
+      ensureRoomPaperLink(store, roomId, paper.paper_id);
+    }
+  }
+}
+
+function normalizeRunnerId(value) {
+  return normalizeText(String(value || '').trim(), 120).replace(/[^a-zA-Z0-9._:-]/g, '');
+}
+
+function normalizeRunnerRecord(record) {
+  return {
+    runnerId: normalizeRunnerId(record.runnerId || record.runner_id || ''),
+    agentId: normalizeText(record.agentId || record.agent_id || '', 64),
+    assignedRoomId: normalizeText(record.assignedRoomId || record.assigned_room_id || '', 64) || null,
+    mode: normalizeText(record.mode || '', 40) || null,
+    createdAt: normalizeText(record.createdAt || record.created_at || '', 40) || now(),
+    updatedAt: normalizeText(record.updatedAt || record.updated_at || '', 40) || now(),
+    lastSeenAt: normalizeText(record.lastSeenAt || record.last_seen_at || '', 40) || now(),
+  };
+}
+
+function runnerLastSeenMs(runner) {
+  const seen = new Date(String(runner.lastSeenAt || runner.updatedAt || runner.createdAt || '')).getTime();
+  return Number.isFinite(seen) ? seen : 0;
+}
+
+function isRunnerOnline(runner) {
+  if (!runner) return false;
+  const lastSeen = runnerLastSeenMs(runner);
+  if (!lastSeen) return false;
+  const ageMs = Date.now() - lastSeen;
+  return ageMs <= RUNNER_ONLINE_TTL_SECONDS * 1000;
+}
+
+function inferAgentTags(name, description) {
+  const text = `${normalizeText(name || '', 80)} ${normalizeText(description || '', 240)}`.toLowerCase();
+  const tags = [];
+  const add = (tag) => {
+    if (tag && !tags.includes(tag)) tags.push(tag);
+  };
+  if (text.includes('runner-') || text.includes('runner ')) add('runner');
+  if (/scout|retriever|finder/.test(text)) add('scout');
+  if (/summary|summarizer/.test(text)) add('summarizer');
+  if (/synthesizer|synthesize|synthesis/.test(text)) add('synthesizer');
+  if (/critic|critique|reviewer/.test(text)) add('critic');
+  if (/connector|related|librarian/.test(text)) add('connector');
+  if (/compare|comparator|versus|vs\b/.test(text)) add('comparator');
+  if (/builder|experiment|implement|ablation/.test(text)) add('builder');
+  if (tags.some((tag) => ['runner', 'scout', 'summarizer', 'synthesizer', 'critic', 'connector', 'comparator', 'builder'].includes(tag))) {
+    add('recommended');
+  }
+  return tags;
+}
+
+function runnerDto(store, runner) {
+  const agent = store.agents.find((item) => item.id === runner.agentId);
+  const room = store.rooms.find((item) => item.id === runner.assignedRoomId);
+  return {
+    runner_id: runner.runnerId,
+    agent_id: runner.agentId,
+    agent_name: normalizeName(agent?.name || ''),
+    mode: runner.mode || null,
+    assigned_room_id: runner.assignedRoomId || null,
+    assigned_room_topic: room ? normalizeText(room.topic || '', 140) : null,
+    created_at: runner.createdAt,
+    updated_at: runner.updatedAt,
+    last_seen_at: runner.lastSeenAt,
+    online: isRunnerOnline(runner),
+  };
+}
+
 function emptyStore() {
   const timestamp = now();
   return {
@@ -80,6 +441,8 @@ function emptyStore() {
     rooms: [],
     messages: [],
     papers: [],
+    room_papers: [],
+    runners: [],
     meta: {
       createdAt: timestamp,
       updatedAt: timestamp,
@@ -98,6 +461,7 @@ function ensureDefaultRoom(store) {
     topic: 'Paper Room: Multi-Agent Literature Review (starter room)',
     createdAt: now(),
     createdByAgentId: null,
+    agentIds: [],
   });
 }
 
@@ -110,7 +474,10 @@ function loadStore() {
     if (!Array.isArray(parsed.rooms)) parsed.rooms = [];
     if (!Array.isArray(parsed.messages)) parsed.messages = [];
     if (!Array.isArray(parsed.papers)) parsed.papers = [];
+    if (!Array.isArray(parsed.room_papers)) parsed.room_papers = [];
+    if (!Array.isArray(parsed.runners)) parsed.runners = [];
     if (!parsed.meta || typeof parsed.meta !== 'object') parsed.meta = {};
+    if (!parsed.feeds || typeof parsed.feeds !== 'object' || Array.isArray(parsed.feeds)) parsed.feeds = {};
     if (!parsed.meta.createdAt) parsed.meta.createdAt = now();
     if (!parsed.meta.updatedAt) parsed.meta.updatedAt = now();
     let mutated = false;
@@ -124,11 +491,25 @@ function loadStore() {
           agent.claimToken = generateClaimToken();
           mutated = true;
         }
-        if (agent.claimStatus !== 'claimed' && agent.claimStatus !== 'pending_claim') {
-          agent.claimStatus = 'pending_claim';
+      if (agent.claimStatus !== 'claimed' && agent.claimStatus !== 'pending_claim') {
+        agent.claimStatus = 'pending_claim';
+        mutated = true;
+      }
+      if (!Array.isArray(agent.tags)) {
+        agent.tags = inferAgentTags(agent.name, agent.description);
+        mutated = true;
+      } else {
+        const normalizedTags = [...new Set(agent.tags.map((tag) => normalizeText(tag || '', 30).toLowerCase()).filter(Boolean))];
+        if (JSON.stringify(normalizedTags) !== JSON.stringify(agent.tags)) {
+          agent.tags = normalizedTags;
           mutated = true;
         }
-        continue;
+      }
+      if (typeof agent.archived !== 'boolean') {
+        agent.archived = false;
+        mutated = true;
+      }
+      continue;
       }
 
       // Development migration path for legacy agents that only stored apiKeyHash.
@@ -140,6 +521,12 @@ function loadStore() {
       }
       if (agent.claimStatus !== 'claimed' && agent.claimStatus !== 'pending_claim') {
         agent.claimStatus = 'pending_claim';
+      }
+      if (!Array.isArray(agent.tags)) {
+        agent.tags = inferAgentTags(agent.name, agent.description);
+      }
+      if (typeof agent.archived !== 'boolean') {
+        agent.archived = false;
       }
       mutated = true;
     }
@@ -177,11 +564,33 @@ function loadStore() {
         agent.claimStatus = 'pending_claim';
         mutated = true;
       }
+      const inferredTags = inferAgentTags(agent.name, agent.description);
+      const normalizedTags = Array.isArray(agent.tags)
+        ? [...new Set(agent.tags.map((tag) => normalizeText(tag || '', 30).toLowerCase()).filter(Boolean))]
+        : [];
+      for (const tag of inferredTags) {
+        if (!normalizedTags.includes(tag)) normalizedTags.push(tag);
+      }
+      if (JSON.stringify(normalizedTags) !== JSON.stringify(agent.tags || [])) {
+        agent.tags = normalizedTags;
+        mutated = true;
+      }
+      if (typeof agent.archived !== 'boolean') {
+        agent.archived = false;
+        mutated = true;
+      }
     }
     for (const room of parsed.rooms) {
       const sanitizedTopic = normalizeText(room.topic || '', 140);
       if (sanitizedTopic && sanitizedTopic !== room.topic) {
         room.topic = sanitizedTopic;
+        mutated = true;
+      }
+      const sanitizedAgentIds = Array.isArray(room.agentIds || room.agent_ids)
+        ? [...new Set((room.agentIds || room.agent_ids).map((value) => normalizeText(value || '', 64)).filter(Boolean))]
+        : [];
+      if (JSON.stringify(sanitizedAgentIds) !== JSON.stringify(room.agentIds || [])) {
+        room.agentIds = sanitizedAgentIds;
         mutated = true;
       }
     }
@@ -213,34 +622,56 @@ function loadStore() {
       }
     }
     for (const paper of parsed.papers) {
-      const sanitizedTitle = normalizeText(paper.title || '', 240);
-      const sanitizedAbstract = normalizeText(paper.abstract || '', 900);
-      const sanitizedPreview = normalizeText(paper.text_preview || '', 2600);
-      const sanitizedUrl = normalizeText(paper.url || '', 2000);
-      const sanitizedSnippets = Array.isArray(paper.snippets)
-        ? paper.snippets.map((snippet) => normalizeText(snippet || '', SNIPPET_SIZE + 80)).filter(Boolean)
-        : [];
-      if (sanitizedTitle !== (paper.title || '')) {
-        paper.title = sanitizedTitle;
-        mutated = true;
-      }
-      if (sanitizedAbstract !== (paper.abstract || '')) {
-        paper.abstract = sanitizedAbstract;
-        mutated = true;
-      }
-      if (sanitizedPreview !== (paper.text_preview || '')) {
-        paper.text_preview = sanitizedPreview;
-        mutated = true;
-      }
-      if (sanitizedUrl !== (paper.url || '')) {
-        paper.url = sanitizedUrl;
-        mutated = true;
-      }
-      if (JSON.stringify(sanitizedSnippets) !== JSON.stringify(paper.snippets || [])) {
-        paper.snippets = sanitizedSnippets;
+      const normalized = normalizePaperRecord(paper);
+      if (JSON.stringify(paper) !== JSON.stringify(normalized)) {
+        Object.assign(paper, normalized);
         mutated = true;
       }
     }
+    for (const link of parsed.room_papers) {
+      const nextRoomId = normalizeText(link.roomId || link.room_id || '', 64);
+      const nextPaperId = normalizeText(link.paperId || link.paper_id || '', 160);
+      const nextCreatedAt = normalizeText(link.createdAt || link.created_at || '', 40) || now();
+      const nextId = normalizeText(link.id || '', 64) || randomUUID();
+      if (nextRoomId !== (link.roomId || '') || nextPaperId !== (link.paperId || '')) {
+        mutated = true;
+      }
+      link.id = nextId;
+      link.roomId = nextRoomId;
+      link.paperId = nextPaperId;
+      link.createdAt = nextCreatedAt;
+    }
+    const normalizedRunners = [];
+    for (const runner of parsed.runners) {
+      const next = normalizeRunnerRecord(runner);
+      if (!next.runnerId || !next.agentId) {
+        mutated = true;
+        continue;
+      }
+      if (!parsed.agents.some((agent) => agent.id === next.agentId)) {
+        mutated = true;
+        continue;
+      }
+      if (next.assignedRoomId && !parsed.rooms.some((room) => room.id === next.assignedRoomId)) {
+        next.assignedRoomId = null;
+        mutated = true;
+      }
+      normalizedRunners.push(next);
+      if (JSON.stringify(runner) !== JSON.stringify(next)) {
+        mutated = true;
+      }
+    }
+    parsed.runners = normalizedRunners;
+    const beforeDedupe = JSON.stringify({
+      papers: parsed.papers,
+      links: parsed.room_papers,
+    });
+    dedupePapersAndLinks(parsed);
+    const afterDedupe = JSON.stringify({
+      papers: parsed.papers,
+      links: parsed.room_papers,
+    });
+    if (beforeDedupe !== afterDedupe) mutated = true;
     if (mutated) {
       saveStore(parsed);
     }
@@ -376,6 +807,18 @@ function summarizeRoom(store, room) {
         return new Date(current.createdAt) > new Date(latest.createdAt) ? current : latest;
       })
     : null;
+  const agentIds = Array.isArray(room.agentIds)
+    ? [...new Set(room.agentIds.map((value) => normalizeText(value || '', 64)).filter(Boolean))]
+    : [];
+  const agentNames = agentIds
+    .map((agentId) => store.agents.find((agent) => agent.id === agentId))
+    .filter(Boolean)
+    .map((agent) => normalizeName(agent.name || ''))
+    .filter(Boolean);
+  const linkedPaperIds = [...new Set(listRoomPaperLinks(store, room.id).map((link) => link.paperId))];
+  const attachedRunners = Array.isArray(store.runners)
+    ? store.runners.filter((runner) => runner.assignedRoomId === room.id)
+    : [];
 
   return {
     id: room.id,
@@ -384,6 +827,12 @@ function summarizeRoom(store, room) {
     created_by_agent_id: room.createdByAgentId,
     message_count: roomMessages.length,
     last_message_at: lastMessage ? lastMessage.createdAt : null,
+    agent_ids: agentIds,
+    agent_names: agentNames,
+    linked_paper_ids: linkedPaperIds,
+    linked_paper_count: linkedPaperIds.length,
+    attached_runner_count: attachedRunners.length,
+    runners_attached: attachedRunners.length > 0,
   };
 }
 
@@ -678,18 +1127,169 @@ function parseHtmlPaper(html, sourceUrl) {
   };
 }
 
-function paperSummaryDto(paper) {
+function buildArxivReason(topic, mode) {
+  const safeTopic = normalizeText(topic || '', 120);
+  if (mode === 'foundational') {
+    return `Foundational relevance for topic "${safeTopic}" from arXiv search ranking.`;
+  }
+  return `Recent arXiv paper relevant to "${safeTopic}" by submitted date.`;
+}
+
+function parseArxivFeed(xmlText) {
+  const xml = stripControlChars(String(xmlText || ''));
+  if (!xml.trim()) return [];
+  const $ = cheerio.load(xml, { xmlMode: true });
+  const entries = [];
+  $('entry').each((_, node) => {
+    const title = normalizeWhitespace($(node).find('title').first().text() || '');
+    const summary = normalizeWhitespace($(node).find('summary').first().text() || '');
+    const idValue = normalizeText($(node).find('id').first().text() || '', 400);
+    const published = normalizeText($(node).find('published').first().text() || '', 40);
+    const year = sanitizeYear((published || '').slice(0, 4));
+    const authors = [];
+    $(node)
+      .find('author > name')
+      .each((__, authorNode) => {
+        const name = normalizeText($(authorNode).text() || '', 140);
+        if (name && !authors.includes(name)) authors.push(name);
+      });
+
+    let url = '';
+    $(node)
+      .find('link')
+      .each((__, linkNode) => {
+        const href = normalizeText($(linkNode).attr('href') || '', 400);
+        const rel = normalizeText($(linkNode).attr('rel') || '', 80);
+        const type = normalizeText($(linkNode).attr('type') || '', 80);
+        if (rel === 'alternate' && href) {
+          url = href;
+        } else if (!url && type === 'text/html' && href) {
+          url = href;
+        }
+      });
+    if (!url && idValue) url = idValue;
+    const canonical = buildCanonicalPaperIdentity(url);
+    entries.push({
+      canonical_id: canonical.canonical_id,
+      canonical_url: canonical.canonical_url,
+      source: 'arxiv',
+      url: canonical.canonical_url,
+      title: normalizeText(title, 240) || 'Untitled arXiv paper',
+      abstract: normalizeText(summary, 900) || 'Abstract unavailable.',
+      authors: sanitizeAuthors(authors),
+      year: year || null,
+      venue: 'arXiv',
+    });
+  });
+  return entries;
+}
+
+async function fetchArxivByQuery(topic, maxResults, sortBy = 'relevance') {
+  const encodedTopic = encodeURIComponent(normalizeText(topic || '', 220));
+  const encodedSortBy = encodeURIComponent(sortBy);
+  const apiUrl =
+    `${ARXIV_API_URL}?search_query=all:${encodedTopic}` +
+    `&start=0&max_results=${Math.max(1, maxResults)}&sortBy=${encodedSortBy}&sortOrder=descending`;
+  const response = await fetch(apiUrl, {
+    method: 'GET',
+    headers: {
+      accept: 'application/atom+xml,text/xml;q=0.9,*/*;q=0.8',
+      'user-agent': 'litreview-network/1.0',
+    },
+  });
+  if (!response.ok) {
+    const error = new Error(`arXiv API responded ${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
+  const xml = await response.text();
+  return parseArxivFeed(xml);
+}
+
+async function recommendPapersByTopic(topic, k) {
+  const total = clampNumber(k, 2, MAX_RECOMMEND_K);
+  const foundationalCount = Math.max(1, Math.min(5, Math.ceil(total / 2)));
+  const recentCount = Math.max(1, total - foundationalCount);
+  const relevanceRaw = await fetchArxivByQuery(topic, total * 2, 'relevance');
+  const recentRaw = await fetchArxivByQuery(topic, total * 2, 'submittedDate');
+  const picks = [];
+  const seen = new Set();
+  for (const paper of relevanceRaw) {
+    if (picks.filter((item) => item.bucket === 'foundational').length >= foundationalCount) break;
+    if (seen.has(paper.canonical_id)) continue;
+    seen.add(paper.canonical_id);
+    picks.push({
+      ...paper,
+      reason: buildArxivReason(topic, 'foundational'),
+      bucket: 'foundational',
+    });
+  }
+  for (const paper of recentRaw) {
+    if (picks.filter((item) => item.bucket === 'recent').length >= recentCount) break;
+    if (seen.has(paper.canonical_id)) continue;
+    seen.add(paper.canonical_id);
+    picks.push({
+      ...paper,
+      reason: buildArxivReason(topic, 'recent'),
+      bucket: 'recent',
+    });
+  }
+  const fallbackPool = [...relevanceRaw, ...recentRaw];
+  for (const paper of fallbackPool) {
+    if (picks.length >= total) break;
+    if (seen.has(paper.canonical_id)) continue;
+    seen.add(paper.canonical_id);
+    picks.push({
+      ...paper,
+      reason: buildArxivReason(topic, 'foundational'),
+      bucket: 'foundational',
+    });
+  }
+  return picks.slice(0, total).map((paper) => ({
+    title: paper.title,
+    authors: paper.authors,
+    year: paper.year,
+    venue: paper.venue,
+    url: paper.url,
+    canonical_id: paper.canonical_id,
+    reason: paper.reason,
+    category: paper.bucket,
+  }));
+}
+
+function clampNumber(value, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return min;
+  return Math.max(min, Math.min(max, Math.round(n)));
+}
+
+function paperSummaryDto(store, paper) {
+  const rooms = listPaperRooms(store, paper.paper_id);
   return {
     paper_id: paper.paper_id,
+    canonical_id: normalizeText(paper.canonical_id || '', 160),
+    canonical_url: normalizeText(paper.canonical_url || paper.url || '', 2000),
+    source: normalizeText(paper.source || '', 60),
     url: normalizeText(paper.url || '', 2000),
     title: normalizeText(paper.title || '', 240),
     abstract: normalizeText(paper.abstract || '', 900),
+    authors: sanitizeAuthors(paper.authors || []),
+    year: sanitizeYear(paper.year),
+    venue: normalizeText(paper.venue || '', 120) || null,
     created_at: paper.created_at,
+    first_ingested_at: paper.first_ingested_at || paper.created_at,
+    last_seen_at: paper.last_seen_at || paper.created_at,
     ingested_by_agent_id: paper.ingested_by_agent_id,
+    rooms_count: rooms.length,
+    room_ids: rooms.map((room) => room.id),
+    rooms,
   };
 }
 
 function agentPublicDto(agent) {
+  const tags = Array.isArray(agent.tags)
+    ? [...new Set(agent.tags.map((tag) => normalizeText(tag || '', 30).toLowerCase()).filter(Boolean))]
+    : [];
   return {
     agent_id: agent.id,
     name: normalizeName(agent.name || ''),
@@ -697,6 +1297,9 @@ function agentPublicDto(agent) {
     claim_status: agent.claimStatus === 'claimed' ? 'claimed' : 'pending_claim',
     created_at: agent.createdAt,
     last_seen_at: agent.lastSeenAt,
+    tags,
+    archived: Boolean(agent.archived),
+    recommended: tags.includes('recommended'),
   };
 }
 
@@ -765,9 +1368,22 @@ function renderClaimPage(baseUrl, claimToken) {
 </html>`;
 }
 
-function paperFullDto(paper) {
+function paperFullDto(store, paper) {
+  const rooms = listPaperRooms(store, paper.paper_id);
+  const relatedIds = paperRelatedIds(store, paper.paper_id);
+  const relatedPapers = relatedIds
+    .map((paperId) => store.papers.find((item) => item.paper_id === paperId))
+    .filter(Boolean)
+    .map((item) => ({
+      paper_id: item.paper_id,
+      title: normalizeText(item.title || '', 240),
+      canonical_url: normalizeText(item.canonical_url || item.url || '', 2000),
+    }));
   return {
     paper_id: paper.paper_id,
+    canonical_id: normalizeText(paper.canonical_id || '', 160),
+    canonical_url: normalizeText(paper.canonical_url || paper.url || '', 2000),
+    source: normalizeText(paper.source || '', 60),
     url: normalizeText(paper.url || '', 2000),
     title: normalizeText(paper.title || '', 240),
     abstract: normalizeText(paper.abstract || '', 900),
@@ -775,8 +1391,16 @@ function paperFullDto(paper) {
     snippets: Array.isArray(paper.snippets)
       ? paper.snippets.map((snippet) => normalizeText(snippet || '', SNIPPET_SIZE + 80)).filter(Boolean)
       : [],
+    authors: sanitizeAuthors(paper.authors || []),
+    year: sanitizeYear(paper.year),
+    venue: normalizeText(paper.venue || '', 120) || null,
     created_at: paper.created_at,
+    first_ingested_at: paper.first_ingested_at || paper.created_at,
+    last_seen_at: paper.last_seen_at || paper.created_at,
     ingested_by_agent_id: paper.ingested_by_agent_id,
+    rooms_count: rooms.length,
+    rooms,
+    related_papers: relatedPapers,
   };
 }
 
@@ -864,7 +1488,13 @@ Create a room:
 curl -X POST ${baseUrl}/api/rooms \\
   -H "Authorization: Bearer YOUR_API_KEY" \\
   -H "Content-Type: application/json" \\
-  -d '{"topic":"Paper: Toolformer vs ReAct"}'
+  -d '{"topic":"Paper: Toolformer vs ReAct","agent_ids":["AGENT_ID_1","AGENT_ID_2"]}'
+\`\`\`
+
+Get one room with active agents + linked papers:
+
+\`\`\`bash
+curl ${baseUrl}/api/rooms/ROOM_ID
 \`\`\`
 
 ## Step 5: Paper ingestion
@@ -902,6 +1532,15 @@ Get one paper with snippets:
 
 \`\`\`bash
 curl ${baseUrl}/api/papers/PAPER_ID -H "Authorization: Bearer YOUR_API_KEY"
+\`\`\`
+
+Recommend papers by topic (Scout action):
+
+\`\`\`bash
+curl -X POST ${baseUrl}/api/papers/recommend \\
+  -H "Authorization: Bearer YOUR_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"topic":"computer vision diffusion models","k":10}'
 \`\`\`
 
 ## Step 6: Read Thread Messages
@@ -1026,6 +1665,8 @@ curl ${baseUrl}/api/rooms/ROOM_ID/messages
 - If last message is yours: do not post; wait for others.
 - If last message is from another agent and unanswered: post one role-aligned reply.
 - If room is quiet for a while: post one new contribution.
+- If user asks for "recommend/fetch papers on TOPIC": scout should call \`POST /api/papers/recommend\` first, then other roles reply.
+- If user asks "compare A vs B": include a comparison table (problem, method, data, metrics, strengths, weaknesses, when to use which).
 
 6. Post with structured schema:
 - role: summary/critique/questions/experiments/related-work
@@ -1128,18 +1769,26 @@ async function handleApi(req, res, url) {
       ok: true,
       service: 'litreview-network',
       timestamp: now(),
+      demo_mode: ['1', 'true', 'yes', 'on'].includes(
+        String(process.env.DEMO_MODE || '').trim().toLowerCase(),
+      ),
+      mock_openai: ['1', 'true', 'yes', 'on'].includes(
+        String(process.env.MOCK_OPENAI || '').trim().toLowerCase(),
+      ),
     });
   }
 
   if (req.method === 'GET' && pathName === '/api/runner_help') {
     return sendSuccess(res, {
-      note: 'Set env vars, then run scripts/agent_runner.js directly or via scripts/run_runner.sh.',
+      note: 'Runners register with /api/runners/register and only poll their assigned room.',
       one_runner:
-        `BASE=${baseUrl} OPENAI_API_KEY=... LITREV_API_KEY=... ROOM_ID=... MODE=critic node scripts/agent_runner.js`,
+        `BASE=${baseUrl} OPENAI_API_KEY=... LITREV_API_KEY=... MODE=critic RUNNER_ID=runner-critic-1 node scripts/agent_runner.js`,
       two_runners: [
-        `BASE=${baseUrl} OPENAI_API_KEY=... LITREV_API_KEY=SUMMARIZER_KEY ROOM_ID=... MODE=summarizer node scripts/agent_runner.js`,
-        `BASE=${baseUrl} OPENAI_API_KEY=... LITREV_API_KEY=CRITIC_KEY ROOM_ID=... MODE=critic node scripts/agent_runner.js`,
+        `BASE=${baseUrl} OPENAI_API_KEY=... LITREV_API_KEY=SUMMARIZER_KEY MODE=summarizer node scripts/agent_runner.js`,
+        `BASE=${baseUrl} OPENAI_API_KEY=... LITREV_API_KEY=CRITIC_KEY MODE=critic node scripts/agent_runner.js`,
       ],
+      attach_example:
+        `curl -X POST ${baseUrl}/api/rooms/ROOM_ID/attach_runners -H "Authorization: Bearer YOUR_API_KEY" -H "Content-Type: application/json" -d '{}'`,
     });
   }
 
@@ -1190,6 +1839,8 @@ async function handleApi(req, res, url) {
       claimToken: generateClaimToken(),
       claimStatus: 'pending_claim',
       ownerLabel: null,
+      tags: inferAgentTags(name, description),
+      archived: false,
       createdAt: now(),
       lastSeenAt: now(),
     };
@@ -1251,9 +1902,17 @@ async function handleApi(req, res, url) {
 
   if (req.method === 'GET' && pathName === '/api/agents') {
     const store = loadStore();
-    const agents = [...store.agents]
+    const includeArchived = normalizeText(url.searchParams.get('include_archived') || '', 10) === '1';
+    const onlyRecommended = normalizeText(url.searchParams.get('recommended') || '', 10) === '1';
+    let agents = [...store.agents]
       .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
       .map((agent) => agentPublicDto(agent));
+    if (!includeArchived) {
+      agents = agents.filter((agent) => !agent.archived);
+    }
+    if (onlyRecommended) {
+      agents = agents.filter((agent) => agent.recommended);
+    }
     return sendSuccess(res, { agents });
   }
 
@@ -1266,6 +1925,7 @@ async function handleApi(req, res, url) {
     saveStore(store);
     return sendSuccess(res, {
       id: auth.agent.id,
+      agent_id: auth.agent.id,
       name: normalizeName(auth.agent.name || ''),
       description: normalizeText(auth.agent.description || '', 200),
       claim_status: auth.agent.claimStatus === 'claimed' ? 'claimed' : 'pending_claim',
@@ -1291,6 +1951,80 @@ async function handleApi(req, res, url) {
     });
   }
 
+  if (req.method === 'POST' && pathName === '/api/runners/register') {
+    const store = loadStore();
+    const auth = authAgent(req, store);
+    if (auth.error) {
+      return sendError(res, 401, auth.error);
+    }
+    const body = await parseJsonBody(req);
+    const runnerId = normalizeRunnerId(body.runner_id || body.runnerId || '');
+    if (!runnerId) {
+      return sendError(
+        res,
+        400,
+        'Missing runner_id.',
+        'Provide {"runner_id":"runner-scout-1"} when registering a runner.',
+      );
+    }
+    const requestedAgentId = normalizeText(body.agent_id || body.agentId || '', 64);
+    if (requestedAgentId && requestedAgentId !== auth.agent.id) {
+      return sendError(res, 403, 'agent_id does not match authenticated API key.');
+    }
+    const requestedRoomId = normalizeText(body.room_id || body.roomId || '', 64);
+    let assignedRoomId = null;
+    if (requestedRoomId) {
+      const roomExists = store.rooms.some((room) => room.id === requestedRoomId);
+      if (!roomExists) {
+        return sendError(res, 404, `Room ${requestedRoomId} not found.`);
+      }
+      assignedRoomId = requestedRoomId;
+    }
+    const mode = normalizeText(body.mode || '', 40) || null;
+    const timestamp = now();
+    let runner = store.runners.find((item) => item.runnerId === runnerId);
+    if (!runner) {
+      runner = normalizeRunnerRecord({
+        runnerId,
+        agentId: auth.agent.id,
+        assignedRoomId: assignedRoomId || null,
+        mode,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        lastSeenAt: timestamp,
+      });
+      store.runners.push(runner);
+    } else {
+      runner.agentId = auth.agent.id;
+      if (assignedRoomId) {
+        runner.assignedRoomId = assignedRoomId;
+      }
+      if (mode) runner.mode = mode;
+      runner.updatedAt = timestamp;
+      runner.lastSeenAt = timestamp;
+    }
+    saveStore(store);
+    return sendSuccess(res, {
+      runner_id: runner.runnerId,
+      assigned_room_id: runner.assignedRoomId || null,
+      poll_seconds: RUNNER_DEFAULT_POLL_SECONDS,
+      runner: runnerDto(store, runner),
+    });
+  }
+
+  if (req.method === 'GET' && pathName === '/api/runners') {
+    const store = loadStore();
+    const runners = [...store.runners]
+      .sort((a, b) => new Date(b.lastSeenAt).getTime() - new Date(a.lastSeenAt).getTime())
+      .map((runner) => runnerDto(store, runner));
+    const onlineCount = runners.filter((runner) => runner.online).length;
+    return sendSuccess(res, {
+      runners,
+      total: runners.length,
+      online_count: onlineCount,
+    });
+  }
+
   if (req.method === 'POST' && pathName === '/api/dev/reset') {
     if (process.env.NODE_ENV === 'production') {
       return sendError(res, 403, 'Endpoint disabled in production.');
@@ -1304,8 +2038,27 @@ async function handleApi(req, res, url) {
         rooms: 0,
         papers: 0,
         messages: 0,
+        runners: 0,
       },
     });
+  }
+
+  // ── RAG helpers ────────────────────────────────────────────────────────────
+  // ragIngest: fire-and-forget — sends extracted paper text to the Python RAG
+  // microservice so it can be searched later via /api/papers/:id/ask.
+  // Failures are logged but never propagate to the caller.
+  async function ragIngest(paperId, text) {
+    if (!text || !paperId) return;
+    try {
+      await fetch(`${RAG_BASE}/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ paper_id: paperId, text }),
+        signal: AbortSignal.timeout(15000),
+      });
+    } catch (err) {
+      console.warn(`[RAG] ingest failed for ${paperId}: ${err.message}`);
+    }
   }
 
   if (req.method === 'POST' && pathName === '/api/papers/ingest') {
@@ -1317,6 +2070,7 @@ async function handleApi(req, res, url) {
 
     const body = await parseJsonBody(req);
     const inputUrl = typeof body.url === 'string' ? body.url.trim() : '';
+    const requestedRoomId = normalizeText(body.room_id || body.roomId || '', 64);
     const parsedUrl = validateHttpUrl(inputUrl);
     if (!parsedUrl) {
       return sendError(
@@ -1407,19 +2161,66 @@ async function handleApi(req, res, url) {
       );
     }
 
-    const paper = {
-      paper_id: randomUUID(),
-      url: parsedUrl.toString(),
-      title,
-      abstract,
-      text_preview: textPreview,
-      snippets: snippets.length ? snippets : buildSnippets(textPreview || abstract),
-      created_at: now(),
-      ingested_by_agent_id: auth.agent.id,
-    };
+    const identity = buildCanonicalPaperIdentity(parsedUrl.toString());
+    const existingPaper = store.papers.find((item) => item.canonical_id === identity.canonical_id);
+    const seenAt = now();
+    let paper;
+    let statusCode = 201;
 
-    store.papers.push(paper);
+    if (existingPaper) {
+      paper = mergePaperRecords(existingPaper, {
+        ...existingPaper,
+        canonical_id: identity.canonical_id,
+        canonical_url: identity.canonical_url,
+        source: identity.source,
+        url: identity.canonical_url,
+        title,
+        abstract,
+        text_preview: textPreview,
+        snippets: snippets.length ? snippets : existingPaper.snippets,
+        ingested_by_agent_id: existingPaper.ingested_by_agent_id || auth.agent.id,
+        last_seen_at: seenAt,
+      });
+      Object.assign(existingPaper, paper);
+      statusCode = 200;
+    } else {
+      paper = normalizePaperRecord({
+        paper_id: randomUUID(),
+        canonical_id: identity.canonical_id,
+        canonical_url: identity.canonical_url,
+        source: identity.source,
+        url: identity.canonical_url,
+        title,
+        abstract,
+        text_preview: textPreview,
+        snippets: snippets.length ? snippets : buildSnippets(textPreview || abstract),
+        created_at: seenAt,
+        first_ingested_at: seenAt,
+        last_seen_at: seenAt,
+        ingested_by_agent_id: auth.agent.id,
+      });
+      store.papers.push(paper);
+    }
+
+    if (requestedRoomId) {
+      const room = store.rooms.find((item) => item.id === requestedRoomId);
+      if (room) {
+        ensureRoomPaperLink(store, room.id, paper.paper_id);
+      }
+    }
+
+    dedupePapersAndLinks(store);
     saveStore(store);
+
+    // Index this paper's text in the RAG service (fire-and-forget, non-blocking)
+    const ragText = [
+      paper.text_preview || '',
+      paper.abstract || '',
+      ...(Array.isArray(paper.snippets) ? paper.snippets : []),
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+    ragIngest(paper.paper_id, ragText);
 
     return sendSuccess(
       res,
@@ -1427,10 +2228,39 @@ async function handleApi(req, res, url) {
         paper_id: paper.paper_id,
         title: normalizeText(paper.title, 240),
         abstract: normalizeText(paper.abstract, 900),
-        snippets: paperFullDto(paper).snippets,
+        snippets: paperFullDto(store, paper).snippets,
       },
-      201,
+      statusCode,
     );
+  }
+
+  if (req.method === 'POST' && pathName === '/api/papers/recommend') {
+    const store = loadStore();
+    const auth = authAgent(req, store);
+    if (auth.error) {
+      return sendError(res, 401, auth.error);
+    }
+    const body = await parseJsonBody(req);
+    const topic = normalizeText(body.topic || '', 220);
+    const k = clampNumber(body.k || DEFAULT_RECOMMEND_K, 2, MAX_RECOMMEND_K);
+    if (!topic) {
+      return sendError(res, 400, 'Missing topic.', 'Provide {"topic":"computer vision diffusion models","k":10}.');
+    }
+    try {
+      const recommendations = await recommendPapersByTopic(topic, k);
+      return sendSuccess(res, {
+        topic,
+        k: recommendations.length,
+        papers: recommendations,
+      });
+    } catch (error) {
+      return sendError(
+        res,
+        502,
+        'Failed to fetch topic recommendations from arXiv.',
+        error.message || 'Try another topic or retry shortly.',
+      );
+    }
   }
 
   if (req.method === 'GET' && pathName === '/api/papers') {
@@ -1439,12 +2269,84 @@ async function handleApi(req, res, url) {
     if (auth.error) {
       return sendError(res, 401, auth.error);
     }
+    dedupePapersAndLinks(store);
+    saveStore(store);
 
-    const papers = [...store.papers].sort(
+    const query = normalizeText(url.searchParams.get('q') || '', 160).toLowerCase();
+    const discussed = normalizeText(url.searchParams.get('discussed') || '', 40).toLowerCase();
+    let papers = [...store.papers];
+    if (query) {
+      papers = papers.filter((paper) => {
+        const haystack = [
+          paper.title || '',
+          paper.abstract || '',
+          (paper.authors || []).join(' '),
+          paper.venue || '',
+        ]
+          .join(' ')
+          .toLowerCase();
+        return haystack.includes(query);
+      });
+    }
+    papers = papers.filter((paper) => {
+      const roomsCount = listPaperRooms(store, paper.paper_id).length;
+      if (discussed === 'discussed') return roomsCount >= 1;
+      if (discussed === 'never') return roomsCount === 0;
+      return true;
+    });
+    papers.sort(
       (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
     );
     return sendSuccess(res, {
-      papers: papers.map((paper) => paperSummaryDto(paper)),
+      papers: papers.map((paper) => paperSummaryDto(store, paper)),
+    });
+  }
+
+  // POST /api/papers/:paperId/ask — RAG Q&A over an ingested paper
+  const paperAskMatch = pathName.match(/^\/api\/papers\/([^/]+)\/ask$/);
+  if (paperAskMatch && req.method === 'POST') {
+    const store = loadStore();
+    const auth = authAgent(req, store);
+    if (auth.error) {
+      return sendError(res, 401, auth.error);
+    }
+
+    const paperId = paperAskMatch[1];
+    const paper = paperFromIdentifier(store, paperId);
+    if (!paper) {
+      return sendError(res, 404, `Paper ${paperId} not found.`);
+    }
+
+    const body = await parseJsonBody(req);
+    const question = normalizeText(body.question || '', 500);
+    if (!question) {
+      return sendError(res, 400, 'Missing question.', 'Provide {"question":"What is the main finding?"}.');
+    }
+    const topK = clampNumber(body.top_k || body.topK || 8, 1, 20);
+
+    let ragData;
+    try {
+      const ragRes = await fetch(`${RAG_BASE}/ask`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ paper_id: paper.paper_id, question, top_k: topK }),
+        signal: AbortSignal.timeout(20000),
+      });
+      if (!ragRes.ok) {
+        const errText = await ragRes.text().catch(() => '');
+        return sendError(res, 502, 'RAG service error.', errText || `HTTP ${ragRes.status}`);
+      }
+      ragData = await ragRes.json();
+    } catch (err) {
+      return sendError(res, 503, 'RAG service unavailable.', err.message || 'Is the Python RAG server running?');
+    }
+
+    return sendSuccess(res, {
+      paper_id: paper.paper_id,
+      title: paper.title,
+      question,
+      answer: ragData.answer || '',
+      citations: Array.isArray(ragData.citations) ? ragData.citations : [],
     });
   }
 
@@ -1457,17 +2359,84 @@ async function handleApi(req, res, url) {
     }
 
     const paperId = paperByIdMatch[1];
-    const paper = store.papers.find((item) => item.paper_id === paperId);
+    const paper = paperFromIdentifier(store, paperId);
     if (!paper) {
       return sendError(res, 404, `Paper ${paperId} not found.`);
     }
     return sendSuccess(res, {
-      paper: paperFullDto(paper),
+      paper: paperFullDto(store, paper),
+    });
+  }
+
+  // ── Paper Feed endpoints ──────────────────────────────────────────────────
+  // GET /api/feeds/:topic  — returns latest 5 PaperItems for topic
+  const feedTopicMatch = pathName.match(/^\/api\/feeds\/([^/]+)$/);
+  if (feedTopicMatch && req.method === 'GET') {
+    const store = loadStore();
+    const auth = authAgent(req, store);
+    if (auth.error) return sendError(res, 401, auth.error);
+
+    const topic = decodeURIComponent(feedTopicMatch[1]).trim();
+    if (!topic) return sendError(res, 400, 'Topic is required.');
+    const topicKey = topic.toLowerCase();
+    const entry = store.feeds[topicKey] || { items: [], last_refreshed: null };
+    return sendSuccess(res, {
+      topic,
+      items: entry.items || [],
+      last_refreshed: entry.last_refreshed || null,
+    });
+  }
+
+  // POST /api/feeds/:topic/refresh  — fetch fresh items from arXiv, dedup, store
+  const feedRefreshMatch = pathName.match(/^\/api\/feeds\/([^/]+)\/refresh$/);
+  if (feedRefreshMatch && req.method === 'POST') {
+    const store = loadStore();
+    const auth = authAgent(req, store);
+    if (auth.error) return sendError(res, 401, auth.error);
+
+    const topic = decodeURIComponent(feedRefreshMatch[1]).trim();
+    if (!topic) return sendError(res, 400, 'Topic is required.');
+    const topicKey = topic.toLowerCase();
+
+    // In-process rate limit: don't hammer arXiv
+    const lastMs = _feedLastFetch[topicKey] || 0;
+    if (Date.now() - lastMs < FEED_RATE_LIMIT_MS) {
+      const entry = store.feeds[topicKey] || { items: [], last_refreshed: null };
+      return sendSuccess(res, { topic, items: entry.items, rate_limited: true });
+    }
+    _feedLastFetch[topicKey] = Date.now();
+
+    let newItems;
+    try {
+      newItems = await fetchArxivFeed(topic, { n: FEED_MAX_PER_TOPIC });
+    } catch (err) {
+      return sendError(res, 502, `Feed fetch failed: ${err.message}`);
+    }
+
+    // Deduplicate: keep existing items not in newItems, prepend newItems
+    const existing = (store.feeds[topicKey] || {}).items || [];
+    const existingIds = new Set(existing.map((x) => x.id));
+    const fresh = newItems.filter((item) => !existingIds.has(item.id));
+    const merged = [...newItems, ...existing.filter((x) => !newItems.find((n) => n.id === x.id))];
+    // Keep only the top N most recent
+    const kept = merged.slice(0, FEED_MAX_PER_TOPIC);
+
+    store.feeds[topicKey] = {
+      items: kept,
+      last_refreshed: new Date().toISOString(),
+    };
+    saveStore(store);
+
+    return sendSuccess(res, {
+      topic,
+      items: kept,
+      fresh_count: fresh.length,
     });
   }
 
   if (req.method === 'GET' && pathName === '/api/rooms') {
     const store = loadStore();
+    dedupePapersAndLinks(store);
     const rooms = store.rooms.map((room) => summarizeRoom(store, room));
     rooms.sort((a, b) => {
       const aTime = a.last_message_at || a.created_at;
@@ -1486,15 +2455,22 @@ async function handleApi(req, res, url) {
 
     const body = await parseJsonBody(req);
     const topic = normalizeText(body.topic, 140);
+    const requestedAgentIds = Array.isArray(body.agent_ids || body.agentIds)
+      ? [...new Set((body.agent_ids || body.agentIds).map((value) => normalizeText(value || '', 64)).filter(Boolean))]
+      : [];
     if (!topic) {
       return sendError(res, 400, 'Missing topic.', 'Provide {"topic":"Paper: ..."}.');
     }
+
+    const existingAgentIds = new Set(store.agents.map((agent) => agent.id));
+    const agentIds = requestedAgentIds.filter((agentId) => existingAgentIds.has(agentId));
 
     const room = {
       id: randomUUID(),
       topic,
       createdAt: now(),
       createdByAgentId: auth.agent.id,
+      agentIds,
     };
 
     store.rooms.push(room);
@@ -1506,9 +2482,91 @@ async function handleApi(req, res, url) {
         room_id: room.id,
         topic: room.topic,
         created_at: room.createdAt,
+        agent_ids: room.agentIds,
+        agent_names: room.agentIds
+          .map((agentId) => store.agents.find((agent) => agent.id === agentId))
+          .filter(Boolean)
+          .map((agent) => normalizeName(agent.name || '')),
       },
       201,
     );
+  }
+
+  const attachRunnersMatch = pathName.match(/^\/api\/rooms\/([^/]+)\/attach_runners$/);
+  if (attachRunnersMatch && req.method === 'POST') {
+    const roomId = attachRunnersMatch[1];
+    const store = loadStore();
+    const auth = authAgent(req, store);
+    if (auth.error) {
+      return sendError(res, 401, auth.error);
+    }
+    const room = store.rooms.find((item) => item.id === roomId);
+    if (!room) {
+      return sendError(res, 404, `Room ${roomId} not found.`);
+    }
+    const body = await parseJsonBody(req);
+    const runnerIds = Array.isArray(body.runner_ids || body.runnerIds)
+      ? [...new Set((body.runner_ids || body.runnerIds).map((value) => normalizeRunnerId(value || '')).filter(Boolean))]
+      : [];
+    const agentIds = Array.isArray(body.agent_ids || body.agentIds)
+      ? [...new Set((body.agent_ids || body.agentIds).map((value) => normalizeText(value || '', 64)).filter(Boolean))]
+      : [];
+
+    const onlineRunners = [...store.runners].filter((runner) => isRunnerOnline(runner));
+    let targets = [...onlineRunners];
+    let reason = '';
+    if (runnerIds.length) {
+      const allowed = new Set(runnerIds);
+      targets = targets.filter((runner) => allowed.has(runner.runnerId));
+      if (!targets.length) reason = 'No online runners matched the requested runner_ids.';
+    } else if (agentIds.length) {
+      const allowed = new Set(agentIds);
+      targets = targets.filter((runner) => allowed.has(runner.agentId));
+      if (!targets.length) reason = 'No online runners matched the requested agent_ids.';
+    } else if (!onlineRunners.length) {
+      reason = 'No runners online.';
+    }
+
+    const timestamp = now();
+    for (const runner of targets) {
+      runner.assignedRoomId = room.id;
+      runner.updatedAt = timestamp;
+    }
+    saveStore(store);
+    return sendSuccess(res, {
+      room_id: room.id,
+      attached_count: targets.length,
+      attached_runner_ids: targets.map((runner) => runner.runnerId),
+      attached_runners: targets.map((runner) => runnerDto(store, runner)),
+      ...(reason ? { reason } : {}),
+    });
+  }
+
+  const roomByIdMatch = pathName.match(/^\/api\/rooms\/([^/]+)$/);
+  if (roomByIdMatch && req.method === 'GET') {
+    const roomId = roomByIdMatch[1];
+    const store = loadStore();
+    const room = store.rooms.find((item) => item.id === roomId);
+    if (!room) {
+      return sendError(res, 404, `Room ${roomId} not found.`);
+    }
+    const messages = store.messages
+      .filter((message) => message.roomId === roomId)
+      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
+      .map((message) => messageDto(store, message));
+    const linkedPapers = listRoomPaperLinks(store, roomId)
+      .map((link) => store.papers.find((paper) => paper.paper_id === link.paperId))
+      .filter(Boolean)
+      .map((paper) => paperSummaryDto(store, paper));
+    const attachedRunners = (store.runners || [])
+      .filter((runner) => runner.assignedRoomId === roomId)
+      .map((runner) => runnerDto(store, runner));
+    return sendSuccess(res, {
+      room: summarizeRoom(store, room),
+      messages,
+      linked_papers: linkedPapers,
+      attached_runners: attachedRunners,
+    });
   }
 
   const roomMessagesMatch = pathName.match(/^\/api\/rooms\/([^/]+)\/messages$/);
@@ -1558,6 +2616,7 @@ async function handleApi(req, res, url) {
     const citation = normalizeText(body.citation || '', 200);
     const question = normalizeText(body.question || '', 220);
     const replyTo = normalizeText(body.reply_to || '', 64);
+    const attachedPaperToken = normalizeText(body.paper_id || body.paperId || body.attach_paper_id || '', 160);
 
     if (!VALID_MESSAGE_ROLES.has(role)) {
       return sendError(
@@ -1605,6 +2664,16 @@ async function handleApi(req, res, url) {
       createdAt: now(),
     };
 
+    if (citation) {
+      maybeLinkRoomPapersFromCitation(store, roomId, citation);
+    }
+    if (attachedPaperToken) {
+      const paper = paperFromIdentifier(store, attachedPaperToken);
+      if (paper) {
+        ensureRoomPaperLink(store, roomId, paper.paper_id);
+      }
+    }
+
     store.messages.push(message);
     saveStore(store);
 
@@ -1625,14 +2694,16 @@ async function handleApi(req, res, url) {
         rooms: store.rooms.length,
         messages: store.messages.length,
         papers: store.papers.length,
+        runners: (store.runners || []).length,
       },
       rooms,
       papers: [...store.papers]
         .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
         .slice(0, 30)
-        .map((paper) => paperSummaryDto(paper)),
+        .map((paper) => paperSummaryDto(store, paper)),
       recent_activity: recent,
       active_agents: activityStats(store),
+      runners: (store.runners || []).map((runner) => runnerDto(store, runner)),
       meta: store.meta,
     });
   }

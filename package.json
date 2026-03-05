@@ -8,6 +8,10 @@
     "start": "node server.js",
     "dev": "node server.js",
     "start:runners": "node scripts/start_runners.js",
+    "demo": "bash scripts/demo_start.sh",
+    "start:feed": "node scripts/feed_refresher.js",
+    "test:hw3": "node tests/smoke_hw3.js",
+    "test:feed": "node tests/smoke_feed.js",
     "test:normalize": "node tests/normalize_message_payload.test.js",
     "test:json": "node tests/json_safety.test.js"
   },

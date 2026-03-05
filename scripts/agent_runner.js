@@ -1,12 +1,37 @@
 #!/usr/bin/env node
 'use strict';
 
+// Auto-load .env from project root (no external deps needed)
+(function loadDotEnv() {
+  const fs = require('fs');
+  const path = require('path');
+  const envPath = path.join(__dirname, '..', '.env');
+  if (!fs.existsSync(envPath)) return;
+  const lines = fs.readFileSync(envPath, 'utf8').split('\n');
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq < 1) continue;
+    const key = line.slice(0, eq).trim();
+    const val = line.slice(eq + 1).trim().replace(/^['"]|['"]$/g, '');
+    if (key && !(key in process.env)) {
+      process.env[key] = val;
+    }
+  }
+})();
+
 const { normalizeMessagePayload } = require('./lib/normalize_message_payload');
+const { randomUUID } = require('crypto');
 
 const BASE = String(process.env.BASE || 'http://127.0.0.1:3000').replace(/\/+$/, '');
-const ROOM_ID = String(process.env.ROOM_ID || '').trim();
+const INITIAL_ROOM_ID = String(process.env.ROOM_ID || process.env.INITIAL_ROOM_ID || '').trim();
 const LITREV_API_KEY = String(process.env.LITREV_API_KEY || '').trim();
 const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || '').trim();
+const OPENROUTER_API_KEY = String(process.env.OPENROUTER_API_KEY || '').trim();
+// Use OpenRouter if key is provided; fallback to OpenAI
+const USE_OPENROUTER = Boolean(OPENROUTER_API_KEY);
+const OPENROUTER_MODEL = String(process.env.OPENROUTER_MODEL || 'openai/gpt-4o-mini').trim();
 const DEMO_MODE = ['1', 'true', 'yes', 'on'].includes(
   String(process.env.DEMO_MODE || '').trim().toLowerCase(),
 );
@@ -18,6 +43,8 @@ const DEFAULT_POLL_SECONDS = DEMO_MODE ? 1 : 10;
 const DEFAULT_MIN_SECONDS_BETWEEN_POSTS = DEMO_MODE ? 3 : 20;
 const POLL_SECONDS = Math.max(1, Number(process.env.POLL_SECONDS || DEFAULT_POLL_SECONDS));
 const MODE_RAW = String(process.env.MODE || 'critic').trim().toLowerCase();
+const RUNNER_ID = String(process.env.RUNNER_ID || `runner-${MODE_RAW || 'critic'}-${randomUUID().slice(0, 8)}`).trim();
+const ASSIGNMENT_REFRESH_SECONDS = Math.max(2, Number(process.env.RUNNER_ASSIGNMENT_REFRESH_SECONDS || 5));
 const ENABLE_WEB_SEARCH = ['1', 'true', 'yes', 'on'].includes(
   String(process.env.OPENAI_ENABLE_WEB_SEARCH || '').trim().toLowerCase(),
 );
@@ -48,26 +75,40 @@ const MODE_ALIASES = {
   experimenter: 'builder',
   experiments: 'builder',
   implementer: 'builder',
+  curator: 'curator',
+  synthesizer: 'curator',
+  synthesis: 'curator',
+  relatedwork: 'curator',
+  writer: 'writer',
+  author: 'writer',
+  drafting: 'writer',
+  drafter: 'writer',
 };
 const MODE = MODE_ALIASES[MODE_RAW] || 'critic';
 
-if (!ROOM_ID || !LITREV_API_KEY || (!OPENAI_API_KEY && !USE_MOCK_OPENAI)) {
+if (!LITREV_API_KEY || (!OPENAI_API_KEY && !OPENROUTER_API_KEY && !USE_MOCK_OPENAI)) {
   console.error('Missing required env vars.');
-  console.error('Required: ROOM_ID, LITREV_API_KEY, and OPENAI_API_KEY (or set MOCK_OPENAI=1)');
-  console.error('Example: BASE=http://127.0.0.1:3000 OPENAI_API_KEY=... LITREV_API_KEY=... ROOM_ID=... MODE=critic node scripts/agent_runner.js');
+  console.error('Required: LITREV_API_KEY, and OPENAI_API_KEY or OPENROUTER_API_KEY (or set MOCK_OPENAI=1)');
+  console.error('Example: BASE=http://127.0.0.1:3000 OPENAI_API_KEY=... LITREV_API_KEY=... MODE=critic node scripts/agent_runner.js');
   process.exit(1);
 }
+console.log(`[init] LLM backend: ${USE_OPENROUTER ? `OpenRouter (${OPENROUTER_MODEL})` : `OpenAI (${OPENAI_MODEL})`}`);
 
 const triggerRolesByMode = {
   scout: new Set(['questions']),
   summarizer: new Set(['critique', 'related-work', 'questions', 'experiments']),
   critic: new Set(['summary', 'questions']),
   builder: new Set(['summary', 'critique', 'related-work', 'questions']),
+  curator: new Set(['summary', 'critique']),
+  writer: new Set(['summary', 'critique', 'experiments']),
 };
 
 const state = {
   selfAgentId: '',
   selfName: '',
+  assignedRoomId: '',
+  serverPollSeconds: POLL_SECONDS,
+  lastAssignmentSyncMs: 0,
   lastSeenMessageId: String(process.env.LAST_SEEN_MESSAGE_ID || '').trim(),
   startedFromEmptyRoom: false,
   lastPostedAtMs: 0,
@@ -132,6 +173,34 @@ async function litrevRequest(path, options = {}) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function registerRunner(forceRoomId = '') {
+  const payload = {
+    runner_id: RUNNER_ID,
+    agent_id: state.selfAgentId,
+    mode: MODE,
+  };
+  const roomToken = String(forceRoomId || '').trim();
+  if (roomToken && !state.assignedRoomId) payload.room_id = roomToken;
+  const data = await litrevRequest('/api/runners/register', {
+    method: 'POST',
+    body: payload,
+  });
+  const nextRoomId = String((data && data.assigned_room_id) || '').trim();
+  const nextPoll = Number((data && data.poll_seconds) || POLL_SECONDS);
+  if (Number.isFinite(nextPoll) && nextPoll > 0) {
+    state.serverPollSeconds = Math.max(1, nextPoll);
+  }
+  if (nextRoomId && nextRoomId !== state.assignedRoomId) {
+    console.log(`[${nowIso()}] assignment updated: ${state.assignedRoomId || '(none)'} -> ${nextRoomId}`);
+    state.assignedRoomId = nextRoomId;
+    state.lastSeenMessageId = '';
+    state.startedFromEmptyRoom = false;
+  } else if (!nextRoomId) {
+    state.assignedRoomId = '';
+  }
+  state.lastAssignmentSyncMs = Date.now();
 }
 
 function extractResponseText(data) {
@@ -266,6 +335,79 @@ function builderTemplate() {
   ].join('\n');
 }
 
+function comparatorTemplate() {
+  return [
+    '## Comparison table',
+    '| Dimension | Paper A | Paper B |',
+    '|---|---|---|',
+    '| Problem framing | | |',
+    '| Method | | |',
+    '| Data | | |',
+    '| Metrics | | |',
+    '| Strengths | | |',
+    '| Weaknesses | | |',
+    '| When to use which | | |',
+  ].join('\n');
+}
+
+function curatorTemplate() {
+  return [
+    '## Related Work Synthesis',
+    '- Integrate 2-4 papers from the thread into a cohesive narrative.',
+    '- Use [Author, Year] style inline citations where available.',
+    '',
+    '## Thematic Threads',
+    '- Thread 1: (shared problem framing across papers)',
+    '- Thread 2: (shared method or dataset)',
+    '',
+    '## Agreements',
+    '- What do most sources agree on?',
+    '',
+    '## Tensions / Gaps',
+    '- Where do findings conflict or remain open?',
+    '',
+    '## Transition Statement',
+    '- One sentence positioning our work relative to these papers.',
+  ].join('\n');
+}
+
+function writerTemplate() {
+  return [
+    '## Abstract Draft',
+    '(2-3 sentences: motivation, method, result)',
+    '',
+    '## Introduction Draft',
+    '- Opening hook: why this problem matters now.',
+    '- Gap statement: what prior work leaves unsolved.',
+    '- Contribution claim: one precise sentence.',
+    '',
+    '## Related Work Draft',
+    '- Incorporate Curator synthesis here. Cite [Author, Year] inline.',
+    '',
+    '## Discussion Draft',
+    '- Interpret the main finding.',
+    '- State the most important limitation.',
+    '- One concrete future direction.',
+  ].join('\n');
+}
+
+function detectIntent(message) {
+  const combined = `${message.content || ''}\n${message.question || ''}`.toLowerCase();
+  const recommend = /\b(recommend|fetch|paper list|suggest papers|find papers)\b/.test(combined);
+  const summarizeTop = /\bsummarize\b.*\b(top|best|\d+)\b/.test(combined);
+  const critiquePaper = /\bcritique\b.*\bpaper\b/.test(combined);
+  const compare = /\bcompare\b.+\b(vs|versus)\b/.test(combined);
+  const latest = textHasLatestIntent(combined);
+  let topic = '';
+  const match =
+    combined.match(/\b(?:recommend|fetch|suggest|find)\s+papers?\s+(?:on|about)\s+(.{3,140})$/i) ||
+    combined.match(/\b(?:on|about)\s+(.{3,140})$/i);
+  if (match && match[1]) {
+    topic = String(match[1]).replace(/[?.!]+$/g, '').trim();
+  }
+  return { recommend, summarizeTop, critiquePaper, compare, latest, topic };
+}
+
 function buildSystemPrompt() {
   let roleName = 'Critic agent';
   let sectionRules =
@@ -287,6 +429,18 @@ function buildSystemPrompt() {
     sectionRules =
       'Use headings exactly: Proposed experiments, Applications, Build-next plan, Risks and mitigations.';
     roleDirective = 'Propose concrete next experiments and implementation steps for this repository.';
+  } else if (MODE === 'curator') {
+    roleName = 'Curator agent';
+    sectionRules =
+      'Use headings exactly: Related Work Synthesis, Thematic Threads, Agreements, Tensions / Gaps, Transition Statement.';
+    roleDirective =
+      'Synthesize the summaries and critiques in the thread into a cohesive related-work narrative. Use [Author, Year] inline citations when paper titles are available.';
+  } else if (MODE === 'writer') {
+    roleName = 'Writer agent';
+    sectionRules =
+      'Use headings exactly: Abstract Draft, Introduction Draft, Related Work Draft, Discussion Draft.';
+    roleDirective =
+      'Draft formal academic prose for the paper sections. Draw on all prior summaries, critiques, and curator output in the thread. Be precise and concise.';
   } else if (MODE === 'critic') {
     roleDirective = 'Identify confounds, missing baselines, and at least one ablation to test the claim.';
   }
@@ -304,14 +458,19 @@ function buildSystemPrompt() {
 }
 
 function buildUserPrompt(context) {
-  const template =
-    MODE === 'scout'
+  const template = context.intent && context.intent.compare
+    ? comparatorTemplate()
+    : MODE === 'scout'
       ? scoutTemplate()
       : MODE === 'summarizer'
       ? summaryTemplate()
       : MODE === 'builder'
         ? builderTemplate()
-        : critiqueTemplate();
+        : MODE === 'curator'
+          ? curatorTemplate()
+          : MODE === 'writer'
+            ? writerTemplate()
+            : critiqueTemplate();
   return [
     `Mode: ${MODE}`,
     `Web search enabled: ${ENABLE_WEB_SEARCH ? 'yes' : 'no'}`,
@@ -325,6 +484,10 @@ function buildUserPrompt(context) {
     context.papers,
     '',
     `Carry citation forward if available: ${context.carryCitation || '(none)'}`,
+    '',
+    context.recommendations
+      ? `Topic recommendations from API:\n${context.recommendations}`
+      : 'Topic recommendations from API:\n(none)',
     '',
     'Template to follow:',
     template,
@@ -422,6 +585,56 @@ function buildMockModelOutput(lastMessage, papers) {
     };
   }
 
+  if (MODE === 'curator') {
+    return {
+      content: [
+        '## Related Work Synthesis',
+        '- Three thematic clusters emerge from the thread: retrieval-augmented methods, hierarchical planning, and tool-augmented reasoning.',
+        '- [Mock et al., 2024] addresses long-horizon tasks via latent skill abstraction; [Mock B, 2023] grounds retrieval in external tools.',
+        '',
+        '## Thematic Threads',
+        '- Thread 1: Both papers address the credit-assignment problem in long-horizon tasks using different decomposition strategies.',
+        '- Thread 2: Both rely on offline pre-training corpora, raising questions about distribution shift at test time.',
+        '',
+        '## Agreements',
+        '- Retrieval and planning benefits compound: the combination outperforms either alone in all reported benchmarks.',
+        '',
+        '## Tensions / Gaps',
+        '- [Mock et al., 2024] shows robustness to noisy tools; [Mock B, 2023] does not test this, leaving a reproducibility gap.',
+        '- Neither work reports results on more than one evaluation suite.',
+        '',
+        '## Transition Statement',
+        '- Our work builds on this by jointly optimizing retrieval and planning within a single trainable policy, closing the distribution-shift gap.',
+      ].join('\n'),
+      question: 'Writer: can you now draft an Abstract and Introduction incorporating this related-work framing?',
+      citation: carryCitation || defaultCitation,
+    };
+  }
+
+  if (MODE === 'writer') {
+    return {
+      content: [
+        '## Abstract Draft',
+        'Long-horizon planning under tool uncertainty remains an open challenge. We propose a retrieval-augmented planning agent that jointly optimizes retrieval and policy, achieving state-of-the-art on benchmark X while remaining robust to 30% tool noise.',
+        '',
+        '## Introduction Draft',
+        '- Opening hook: Autonomous agents must plan across many steps using imperfect external tools — a combination that breaks most existing methods.',
+        '- Gap statement: Prior work treats retrieval and planning as separate modules, leaving distribution shift between training and deployment unaddressed.',
+        '- Contribution claim: We introduce a unified retrieval-planning framework trained end-to-end that reduces long-horizon failure rate by Y% on benchmark X.',
+        '',
+        '## Related Work Draft',
+        '- Incorporate Curator synthesis here. [Mock et al., 2024] addresses long-horizon tasks via latent skills; [Mock B, 2023] grounds retrieval in tools. Our work unifies both lines.',
+        '',
+        '## Discussion Draft',
+        '- The main finding confirms that joint optimization outperforms pipeline approaches, consistent with theoretical predictions about compounding error reduction.',
+        '- Primary limitation: results are on a single benchmark; generalization to real-world tasks is future work.',
+        '- Future direction: extend the framework to multi-agent settings where multiple retrievers collaborate on a shared knowledge base.',
+      ].join('\n'),
+      question: 'Critic: does the contribution claim hold up against the baselines in the thread, and what ablation would most directly test it?',
+      citation: carryCitation || defaultCitation,
+    };
+  }
+
   return {
     content: [
       '## Positioning / related work',
@@ -451,7 +664,21 @@ function buildMockModelOutput(lastMessage, papers) {
   };
 }
 
+// Normalise LLM response → { output_text: string }
+function normalizeLLMResponse(data, isOpenRouter) {
+  if (!isOpenRouter) return data; // OpenAI /v1/responses format already has output[].content[].text
+  // OpenRouter / Chat Completions format: choices[0].message.content
+  const content = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+  if (content) {
+    return { output: [{ type: 'message', content: [{ type: 'output_text', text: String(content) }] }] };
+  }
+  return data;
+}
+
 async function callOpenAIWithRetry(systemPrompt, userPrompt) {
+  if (USE_OPENROUTER) {
+    return callOpenRouterWithRetry(systemPrompt, userPrompt);
+  }
   let attempt = 0;
   let allowWebSearch = ENABLE_WEB_SEARCH;
   while (true) {
@@ -537,6 +764,70 @@ async function callOpenAIWithRetry(systemPrompt, userPrompt) {
   }
 }
 
+async function callOpenRouterWithRetry(systemPrompt, userPrompt) {
+  let attempt = 0;
+  while (true) {
+    const controller = new AbortController();
+    const timeoutMs = Number(process.env.OPENAI_TIMEOUT_MS || 45000);
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const requestBody = {
+        model: OPENROUTER_MODEL,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        temperature: 0.3,
+        max_tokens: 1000,
+      };
+
+      const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${OPENROUTER_API_KEY}`,
+          'http-referer': 'https://litreview.network',
+          'x-title': 'LitReview Network',
+        },
+        body: JSON.stringify(requestBody),
+        signal: controller.signal,
+      });
+
+      const raw = await res.text();
+      let data = {};
+      try {
+        data = raw ? JSON.parse(raw) : {};
+      } catch (_) {
+        const err = new Error(`OpenRouter JSON parse failed: ${raw.slice(0, 240)}`);
+        err.status = res.status;
+        throw err;
+      }
+
+      if (!res.ok) {
+        const message = (data && data.error && data.error.message) || `OpenRouter error ${res.status}`;
+        const err = new Error(message);
+        err.status = res.status;
+        err.code = data && data.error && data.error.code ? data.error.code : '';
+        throw err;
+      }
+
+      return normalizeLLMResponse(data, true);
+    } catch (err) {
+      const isRetriable = Number(err.status) === 429;
+      if (!isRetriable || attempt >= MAX_RETRIES) {
+        throw err;
+      }
+      const backoffMs = Math.min(20000, Math.pow(2, attempt) * 1000 + Math.floor(Math.random() * 500));
+      console.warn(`[${nowIso()}] OpenRouter 429 retry ${attempt + 1}/${MAX_RETRIES} in ${backoffMs}ms`);
+      await sleep(backoffMs);
+      attempt += 1;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+}
+
 function extractUrls(text) {
   const source = String(text || '');
   const matches = source.match(/\bhttps?:\/\/[^\s<>"')]+/gi) || [];
@@ -591,8 +882,11 @@ function textHasLatestIntent(text) {
 }
 
 function findLatestIntentMessageIndex(messages) {
+  // Only check 'questions' messages — never match on agent replies (related-work, summary, etc.)
+  // which often contain words like "recent" in their own headings.
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const message = messages[i];
+    if (String(message.role || '').toLowerCase() !== 'questions') continue;
     const combined = `${message.content || ''}\n${message.question || ''}`;
     if (textHasLatestIntent(combined)) {
       return i;
@@ -632,7 +926,23 @@ function normalizeOutput(parsed, fallbackText) {
   const fallbackQuestion = 'What single follow-up test would most reduce uncertainty here?';
 
   if (parsed && typeof parsed === 'object') {
-    const content = String(parsed.content || '').trim();
+    // Guard: if parsed.content is itself an object (LLM returned nested JSON),
+    // flatten it to a readable string instead of letting String() give "[object Object]".
+    let rawContent = parsed.content;
+    let content;
+    if (rawContent && typeof rawContent === 'object') {
+      // Extract all string leaf values and join them into one readable block
+      const parts = Object.entries(rawContent)
+        .map(([k, v]) => {
+          if (typeof v === 'string' && v.trim()) return `## ${k}\n${v.trim()}`;
+          if (Array.isArray(v)) return `## ${k}\n${v.filter(x => typeof x === 'string').join('\n')}`;
+          return '';
+        })
+        .filter(Boolean);
+      content = parts.length ? parts.join('\n\n') : JSON.stringify(rawContent, null, 2);
+    } else {
+      content = String(rawContent || '').trim();
+    }
     const question = String(parsed.question || '').trim();
     return {
       content: content || trunc(String(fallbackText || '').trim(), 1100),
@@ -666,6 +976,7 @@ async function generateReply(lastMessage, messages, papers) {
   }
 
   const context = {
+    intent: detectIntent(lastMessage),
     lastMessage: JSON.stringify(
       {
         id: lastMessage.id,
@@ -699,7 +1010,24 @@ async function generateReply(lastMessage, messages, papers) {
       2,
     ),
     carryCitation: String(lastMessage.citation || '').trim(),
+    recommendations: '',
   };
+
+  if (MODE === 'scout' && context.intent.recommend && context.intent.topic) {
+    try {
+      const recResponse = await litrevRequest('/api/papers/recommend', {
+        method: 'POST',
+        body: { topic: context.intent.topic, k: 10 },
+      });
+      context.recommendations = JSON.stringify(recResponse.papers || [], null, 2);
+    } catch (error) {
+      context.recommendations = JSON.stringify(
+        [{ warning: `recommendation fetch failed: ${error.message}` }],
+        null,
+        2,
+      );
+    }
+  }
 
   const data = await callOpenAIWithRetry(buildSystemPrompt(), buildUserPrompt(context));
   const text = extractResponseText(data);
@@ -723,8 +1051,27 @@ async function generateReply(lastMessage, messages, papers) {
 }
 
 async function tick() {
-  const room = await litrevRequest(`/api/rooms/${encodeURIComponent(ROOM_ID)}/messages`);
+  const needAssignmentRefresh =
+    !state.lastAssignmentSyncMs ||
+    Date.now() - state.lastAssignmentSyncMs > ASSIGNMENT_REFRESH_SECONDS * 1000;
+  if (needAssignmentRefresh) {
+    await registerRunner().catch((err) => {
+      console.warn(`[${nowIso()}] runner register refresh failed: ${err.message}`);
+    });
+  }
+
+  if (!state.assignedRoomId) {
+    console.log(`[${nowIso()}] waiting for room assignment (runner_id=${RUNNER_ID})`);
+    return;
+  }
+
+  const room = await litrevRequest(`/api/rooms/${encodeURIComponent(state.assignedRoomId)}/messages`);
   const messages = Array.isArray(room.messages) ? room.messages : [];
+  const roomInfo = room && room.room ? room.room : {};
+  const selectedAgentIds = Array.isArray(roomInfo.agent_ids) ? roomInfo.agent_ids : [];
+  if (selectedAgentIds.length && state.selfAgentId && !selectedAgentIds.includes(state.selfAgentId)) {
+    return;
+  }
   if (!messages.length) return;
 
   const last = messages[messages.length - 1];
@@ -756,8 +1103,15 @@ async function tick() {
     return;
   }
 
+  const intent = detectIntent(last);
   const latestIntentIndex = findLatestIntentMessageIndex(messages);
-  if (MODE !== 'scout' && latestIntentIndex >= 0 && !hasScoutReplyAfter(messages, latestIntentIndex)) {
+  const requiresScoutFirst = intent.recommend || intent.latest;
+  if (
+    MODE !== 'scout' &&
+    requiresScoutFirst &&
+    latestIntentIndex >= 0 &&
+    !hasScoutReplyAfter(messages, latestIntentIndex)
+  ) {
     state.lastSeenMessageId = last.id;
     console.log(`[${nowIso()}] waiting for scout output before mode=${MODE} response`);
     return;
@@ -807,7 +1161,7 @@ async function tick() {
   }
 
   try {
-    const posted = await litrevRequest(`/api/rooms/${encodeURIComponent(ROOM_ID)}/messages`, {
+    const posted = await litrevRequest(`/api/rooms/${encodeURIComponent(state.assignedRoomId)}/messages`, {
       method: 'POST',
       body: payload,
     });
@@ -830,9 +1184,13 @@ async function main() {
   const me = await litrevRequest('/api/me');
   state.selfAgentId = String((me && (me.agent_id || me.id)) || '').trim();
   state.selfName = String((me && me.name) || '').trim();
-  if (!state.lastSeenMessageId) {
+  await registerRunner(INITIAL_ROOM_ID).catch((err) => {
+    console.warn(`[${nowIso()}] initial runner registration failed: ${err.message}`);
+  });
+
+  if (state.assignedRoomId && !state.lastSeenMessageId) {
     try {
-      const room = await litrevRequest(`/api/rooms/${encodeURIComponent(ROOM_ID)}/messages`);
+      const room = await litrevRequest(`/api/rooms/${encodeURIComponent(state.assignedRoomId)}/messages`);
       const msgs = Array.isArray(room.messages) ? room.messages : [];
       if (msgs.length) {
         const latest = msgs[msgs.length - 1];
@@ -849,13 +1207,16 @@ async function main() {
   }
 
   console.log(`[${nowIso()}] runner started`);
+  console.log(`RUNNER_ID=${RUNNER_ID}`);
   console.log(`BASE=${BASE}`);
-  console.log(`ROOM_ID=${ROOM_ID}`);
+  console.log(`INITIAL_ROOM_ID=${INITIAL_ROOM_ID || '(none)'}`);
+  console.log(`ASSIGNED_ROOM_ID=${state.assignedRoomId || '(none)'}`);
   console.log(`MODE=${MODE}`);
   console.log(`AGENT_ID=${state.selfAgentId || '(unknown)'}`);
   console.log(`AGENT_NAME=${state.selfName || '(unknown)'}`);
   console.log(`DEMO_MODE=${DEMO_MODE ? '1' : '0'}`);
-  console.log(`POLL_SECONDS=${POLL_SECONDS}`);
+  console.log(`POLL_SECONDS(default)=${POLL_SECONDS}`);
+  console.log(`RUNNER_ASSIGNMENT_REFRESH_SECONDS=${ASSIGNMENT_REFRESH_SECONDS}`);
   console.log(`MIN_SECONDS_BETWEEN_POSTS=${MIN_SECONDS_BETWEEN_POSTS}`);
   console.log(`STARTED_FROM_EMPTY_ROOM=${state.startedFromEmptyRoom ? '1' : '0'}`);
   console.log(`MOCK_OPENAI=${USE_MOCK_OPENAI ? '1' : '0'}`);
@@ -871,7 +1232,8 @@ async function main() {
         console.error(`hint: ${err.hint}`);
       }
     }
-    await sleep(POLL_SECONDS * 1000);
+    const sleepSeconds = Math.max(1, state.serverPollSeconds || POLL_SECONDS);
+    await sleep(sleepSeconds * 1000);
   }
 }
 

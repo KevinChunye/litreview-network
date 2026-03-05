@@ -1,20 +1,39 @@
 #!/usr/bin/env node
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
+// Auto-load .env from project root (no external deps needed)
+(function loadDotEnv() {
+  const fs = require('fs');
+  const path = require('path');
+  const envPath = path.join(__dirname, '..', '.env');
+  if (!fs.existsSync(envPath)) return;
+  const lines = fs.readFileSync(envPath, 'utf8').split('\n');
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq < 1) continue;
+    const key = line.slice(0, eq).trim();
+    const val = line.slice(eq + 1).trim().replace(/^['"]|['"]$/g, '');
+    if (key && !(key in process.env)) {
+      process.env[key] = val;
+    }
+  }
+})();
+
 const { spawn } = require('child_process');
 const { randomUUID } = require('crypto');
 
 const RUNNERS = [
-  { name: 'scout', mode: 'scout', keyField: 'scout_key' },
-  { name: 'summarizer', mode: 'summarizer', keyField: 'summarizer_key' },
-  { name: 'critic', mode: 'critic', keyField: 'critic_key' },
-  { name: 'builder', mode: 'builder', keyField: 'builder_key' },
+  { name: 'scout', mode: 'scout', keyField: 'scout' },
+  { name: 'summarizer', mode: 'summarizer', keyField: 'summarizer' },
+  { name: 'critic', mode: 'critic', keyField: 'critic' },
+  { name: 'builder', mode: 'builder', keyField: 'builder' },
+  { name: 'curator', mode: 'curator', keyField: 'curator' },
+  { name: 'writer', mode: 'writer', keyField: 'writer' },
 ];
 
 const base = String(process.env.BASE || 'http://127.0.0.1:3000').trim().replace(/\/+$/, '');
-const sessionPath = String(process.env.SESSION_PATH || '/tmp/litrev-session.json').trim();
 const demoMode = ['1', 'true', 'yes', 'on'].includes(
   String(process.env.DEMO_MODE || '').trim().toLowerCase(),
 );
@@ -39,10 +58,6 @@ function parseClaimToken(claimUrl) {
   if (!text) return '';
   const chunks = text.split('/').filter(Boolean);
   return chunks.length ? chunks[chunks.length - 1] : '';
-}
-
-function ensureParentDir(filePath) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
 }
 
 async function requestApi(pathname, options = {}) {
@@ -128,79 +143,45 @@ async function registerAndClaim(label, description) {
   return apiKey;
 }
 
-function sessionHasKeys(session) {
-  if (!session || typeof session !== 'object') return false;
-  if (!session.room_id) return false;
-  return RUNNERS.every((runner) => Boolean(String(session[runner.keyField] || '').trim()));
-}
-
-async function bootstrapSession() {
-  console.log(`[${nowIso()}] bootstrapping runner session via API endpoints...`);
-  const scoutKey = await registerAndClaim(
-    'scout',
-    'Scout runner: finds recent papers and recommends focus papers.',
-  );
-  const summarizerKey = await registerAndClaim(
-    'summarizer',
-    'Summarizer runner: summarizes methods/claims from selected papers.',
-  );
-  const criticKey = await registerAndClaim(
-    'critic',
-    'Critic runner: identifies confounds and ablation gaps.',
-  );
-  const builderKey = await registerAndClaim(
-    'builder',
-    'Builder runner: proposes experiments and implementation next steps.',
-  );
-
-  const room = await requestApi('/api/rooms', {
-    method: 'POST',
-    apiKey: summarizerKey,
-    body: { topic: `Railway Live Debate Room (${new Date().toISOString()})` },
-  });
-  const roomId = String(room.room_id || '').trim();
-  if (!roomId) {
-    throw new Error('Failed to create room during bootstrap.');
-  }
-
-  return {
-    base,
-    room_id: roomId,
-    scout_key: scoutKey,
-    summarizer_key: summarizerKey,
-    critic_key: criticKey,
-    builder_key: builderKey,
-    third_key: builderKey,
-    third_mode: 'builder',
-    created_at: nowIso(),
+function resolveKeyFromEnv(runner) {
+  const lookup = {
+    scout: ['LITREV_SCOUT_KEY', 'SCOUT_KEY'],
+    summarizer: ['LITREV_SUMMARIZER_KEY', 'SUMMARIZER_KEY'],
+    critic: ['LITREV_CRITIC_KEY', 'CRITIC_KEY'],
+    builder: ['LITREV_BUILDER_KEY', 'BUILDER_KEY', 'LITREV_THIRD_KEY', 'THIRD_KEY'],
+    curator: ['LITREV_CURATOR_KEY', 'CURATOR_KEY'],
+    writer: ['LITREV_WRITER_KEY', 'WRITER_KEY'],
   };
-}
-
-function loadSessionFromDisk(filePath) {
-  try {
-    if (!fs.existsSync(filePath)) return null;
-    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-    return parsed && typeof parsed === 'object' ? parsed : null;
-  } catch (_) {
-    return null;
+  for (const envName of lookup[runner.keyField] || []) {
+    const value = String(process.env[envName] || '').trim();
+    if (value) return value;
   }
+  return '';
 }
 
-function writeSessionToDisk(filePath, session) {
-  ensureParentDir(filePath);
-  fs.writeFileSync(filePath, JSON.stringify(session, null, 2));
-}
-
-async function ensureSession(filePath) {
-  const existing = loadSessionFromDisk(filePath);
-  if (sessionHasKeys(existing)) {
-    const next = { ...existing, base };
-    writeSessionToDisk(filePath, next);
-    return next;
+async function ensureRunnerKeys() {
+  const out = {};
+  for (const runner of RUNNERS) {
+    const existing = resolveKeyFromEnv(runner);
+    if (existing) {
+      out[runner.keyField] = existing;
+      continue;
+    }
+    const description =
+      runner.name === 'scout'
+        ? 'Scout runner: fetches and prioritizes paper recommendations.'
+        : runner.name === 'summarizer'
+          ? 'Summarizer runner: creates grounded structured summaries.'
+          : runner.name === 'critic'
+            ? 'Critic runner: tests claims and ablations.'
+            : runner.name === 'curator'
+              ? 'Curator runner: synthesizes summaries and critiques into a related-work narrative.'
+              : runner.name === 'writer'
+                ? 'Writer runner: drafts formal paper sections (abstract, intro, related work, discussion).'
+                : 'Builder runner: proposes next experiments and implementation steps.';
+    out[runner.keyField] = await registerAndClaim(runner.name, description);
   }
-  const session = await bootstrapSession();
-  writeSessionToDisk(filePath, session);
-  return session;
+  return out;
 }
 
 async function main() {
@@ -210,14 +191,13 @@ async function main() {
 
   console.log(`[${nowIso()}] start:runners init`);
   console.log(`BASE=${base}`);
-  console.log(`SESSION_PATH=${sessionPath}`);
   console.log(`DEMO_MODE=${demoMode ? '1' : '0'}`);
   console.log(`POLL_SECONDS=${effectivePollSeconds}`);
   console.log(`MIN_SECONDS_BETWEEN_POSTS=${effectiveCooldownSeconds}`);
+  console.log('Room assignment is server-managed. Use UI button "Attach runners to this room".');
 
   await waitForHealthz();
-  const session = await ensureSession(sessionPath);
-  console.log(`[${nowIso()}] session ready: room_id=${session.room_id}`);
+  const keys = await ensureRunnerKeys();
 
   const children = [];
   let shuttingDown = false;
@@ -242,28 +222,27 @@ async function main() {
   process.on('SIGTERM', () => shutdownAll('SIGTERM'));
 
   for (const runner of RUNNERS) {
-    const apiKey = String(session[runner.keyField] || '').trim();
-    if (!apiKey) {
-      throw new Error(`Session missing required key: ${runner.keyField}`);
-    }
+    const apiKey = String(keys[runner.keyField] || '').trim();
+    if (!apiKey) throw new Error(`Missing key for runner=${runner.name}`);
+    const runnerId = `runner-${runner.name}-${randomUUID().slice(0, 8)}`;
 
     const env = {
       ...process.env,
       BASE: base,
-      ROOM_ID: String(session.room_id || '').trim(),
       MODE: runner.mode,
+      RUNNER_ID: runnerId,
       LITREV_API_KEY: apiKey,
       DEMO_MODE: demoMode ? '1' : '0',
       POLL_SECONDS: String(effectivePollSeconds),
       MIN_SECONDS_BETWEEN_POSTS: String(effectiveCooldownSeconds),
     };
 
-    const child = spawn(process.execPath, [path.join(__dirname, 'agent_runner.js')], {
+    const child = spawn(process.execPath, [require('path').join(__dirname, 'agent_runner.js')], {
       env,
       stdio: 'inherit',
     });
     children.push(child);
-    console.log(`[${nowIso()}] started ${runner.name} runner pid=${child.pid}`);
+    console.log(`[${nowIso()}] started ${runner.name} runner pid=${child.pid} runner_id=${runnerId}`);
 
     child.on('exit', (code, signal) => {
       if (shuttingDown) return;
